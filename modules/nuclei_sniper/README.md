@@ -4,6 +4,58 @@
 
 Part of the **Centaur-Jarvis** VAPT agent framework.
 
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          NUCLEI SNIPER MODULE                               │
+│                                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   ┌────────────┐ │
+│  │   MONITOR    │    │  GENERATOR   │    │  VALIDATOR   │   │  EXECUTOR  │ │
+│  │  (monitor.py)│    │(generator.py)│    │(validator.py)│   │(executor.py│ │
+│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘   └─────┬──────┘ │
+│         │                   │                   │                  │        │
+│         ▼                   ▼                   ▼                  ▼        │
+│  ┌────────────┐      ┌───────────┐       ┌───────────┐     ┌──────────┐   │
+│  │ RSS Feeds  │      │ AI Router │       │  nuclei   │     │  Redis   │   │
+│  │ GitHub     │──┐   │ (COMPLEX) │◄──┐   │ -validate │     │queue:reco│   │
+│  │ Nitter     │  │   └─────┬─────┘   │   └─────┬─────┘     └────┬─────┘   │
+│  │ PacketStor │  │         │         │         │                 │         │
+│  └────────────┘  │         ▼         │         ▼                 ▼         │
+│                  │   ┌───────────┐   │   ┌───────────┐     ┌──────────┐   │
+│                  │   │  YAML     │   │   │  Pass?    │     │  Recon   │   │
+│                  │   │  Template │   │   │  Yes ──────────►│  Worker  │   │
+│                  │   └───────────┘   │   │  No ──────┘     └──────────┘   │
+│                  │                   │   │  (retry w/     │              │
+│                  │                   │   │   error msg)   │              │
+│                  │                   │   └───────────┘     │              │
+│                  │                                                        │
+│                  ▼                                                        │
+│           ┌──────────────┐                                               │
+│           │    Redis     │                                               │
+│           │queue:nuclei_ │                                               │
+│           │   sniper     │                                               │
+│           │seen_cves set │                                               │
+│           │status:*      │                                               │
+│           └──────────────┘                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+FLOW:
+  [RSS Feeds] ──poll──► [Monitor] ──new CVE──► [Redis Queue]
+                                                    │
+  [Generator] ◄──consume──────────────────────────┘
+       │
+       ├──AI call──► [AI Router] ──YAML──► [Generator]
+       │                                       │
+       ▼                                       ▼
+  [Validator] ──nuclei -validate──► Pass? ──Yes──► [Executor]
+       │                              │              │
+       │                              No             ▼
+       │                              │         [queue:recon]
+       └──────feedback────────────────┘              │
+                                                     ▼
+                                              [Recon Worker]
+                                                     │
+                                                     ▼
+                                            [results:incoming]
+
 ## Overview
 
 The Nuclei Sniper module automates the entire lifecycle of CVE-to-scan:
