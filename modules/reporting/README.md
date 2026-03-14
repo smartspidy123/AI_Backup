@@ -1,3 +1,6 @@
+ASCII Data Flow Diagram
+text
+
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         REPORTING MODULE DATA FLOW                          │
 │                                                                             │
