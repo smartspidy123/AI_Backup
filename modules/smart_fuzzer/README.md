@@ -95,6 +95,14 @@ strict rate limiting, and **adapts** based on server responses.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+modules/smart_fuzzer/
+├── __init__.py
+├── fuzzer.py
+├── payload_generator.py
+├── executor.py
+├── config.yaml
+└── README.md
+
 ## AI Interaction & Mutation Logic
 
 ### Initial Generation
