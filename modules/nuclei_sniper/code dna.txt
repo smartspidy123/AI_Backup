@@ -1,0 +1,126 @@
+
+---
+
+## Deep Dive Post-Mortem (DNA)
+
+### 1. AI Prompt Design and Retry Logic
+
+**Prompt Architecture:**
+
+The prompt system uses a two-tier approach:
+
+1. **System Prompt** (`PromptBuilder.SYSTEM_PROMPT`): Sets the persona and strict output rules. Key design decisions:
+   - Explicitly forbids markdown code blocks, explanations, or extra text
+   - Mandates valid Nuclei v2+ syntax
+   - Prioritizes detection over exploitation (safe checks)
+   - Specifies `{{BaseURL}}` placeholder usage
+
+2. **User Prompt** (dynamic): Two variants:
+   - **Generation prompt**: CVE ID + description + PoC links → raw template
+   - **Correction prompt**: Original YAML + validation error → fixed template
+
+**Retry Logic:**
+Attempt 1: Initial generation prompt
+↓ (if AI fails or YAML is malformed)
+Attempt 2: Correction prompt with error details, backoff = 2s
+↓ (if still fails)
+Attempt 3: Correction prompt with new error details, backoff = 4s
+↓ (if still fails)
+Fallback: Static template stub requiring manual review
+
+text
+
+
+The correction prompt is critical for self-healing: it includes both the broken YAML and the specific error message, giving the AI enough context to fix structural issues (missing fields, bad indentation, invalid matchers).
+
+**YAML Extraction:** The `extract_yaml_from_response()` function handles three common AI output issues:
+- Wrapping in markdown code blocks (` ```yaml ... ``` `)
+- Preamble text before the actual YAML
+- Post-amble explanations after the YAML
+
+### 2. Edge Cases Mitigated
+
+| # | Edge Case | File | Mitigation Code |
+|---|-----------|------|------------------|
+| EC1 | RSS feed unavailable | `monitor.py` | `FeedParser.fetch_feed()` wraps in try/except, logs warning, returns `[]` |
+| EC2 | Duplicate CVE | `monitor.py` | `RedisHelper.is_cve_seen()` uses `SISMEMBER` on Redis set |
+| EC3 | AI unavailable | `generator.py` | `generate_fallback_template()` returns static stub |
+| EC4 | Malformed YAML | `generator.py` | `extract_yaml_from_response()` + retry loop with correction prompt |
+| EC5 | Validation fails | `validator.py` | `validate_with_correction()` feeds error back to generator |
+| EC6 | Nuclei binary missing | `validator.py` | `check_nuclei_binary()` + fallback to YAML-only validation |
+| EC8 | CVE flood | `generator.py` | `RateLimiter` class + `max_entries_per_feed` cap |
+| EC9 | Redis down | `monitor.py` | `RedisHelper` in-memory buffer + reconnection loop |
+| EC10 | No targets | `executor.py` | `_resolve_targets()` checks 3 sources, logs warning if empty |
+| EC12 | Memory explosion | `monitor.py` | `max_entries_per_feed` cap, entries sliced before processing |
+| EC13 | Thread safety | `monitor.py` | `acquire_poll_lock()` / `release_poll_lock()` using Redis `SET NX EX` |
+
+### 3. Remaining Loopholes & Future Improvements
+
+| Loophole | Risk | Future Fix |
+|----------|------|------------|
+| No OAST integration | Cannot detect blind vulnerabilities | Integrate with interactsh for callback-based detection |
+| No automatic PoC extraction | PoC links found but code not parsed | Add PoC code parser to enhance AI prompts |
+| Static severity assignment | Fallback templates always get "unknown" severity | Integrate NVD API for CVSS scores |
+| No template deduplication | If same CVE appears in multiple feeds, only CVE ID dedup happens | Add template similarity hashing |
+| No template versioning | Corrected templates overwrite originals | Store template history in Redis/DB |
+| RSS-only monitoring | Misses CVEs not in RSS feeds | Add NVD API, ExploitDB, GitHub search API |
+| No auth for nitter/feeds | Some feeds may require auth or change URLs | Add configurable auth headers |
+| Single-process design | Each component is a single process | Add multi-worker support with Redis consumer groups |
+| No template scoring | All templates treated equally | Add confidence scoring based on AI model certainty |
+| No integration tests | Only unit-level testing described | Add end-to-end test with mock Redis + mock nuclei |
+
+### 4. Performance Considerations
+
+**Memory:**
+- RSS entries capped at `max_entries_per_feed` (default 50) per feed per poll
+- In-memory buffer for Redis failures capped at `buffer_max_size` (default 100)
+- Template YAML strings are bounded by AI `max_tokens` (4000)
+- Long descriptions truncated at 2000 chars
+
+**API Rate Limits:**
+- `RateLimiter` class enforces `max_calls_per_minute` (default 10) for AI calls
+- `fetch_delay` (default 2s) between RSS feed fetches
+- Exponential backoff on retries (`2^attempt` seconds)
+
+**Redis:**
+- All queue operations use `BRPOP` with timeout (non-spinning)
+- Status keys expire after 7 days (`ex=86400*7`)
+- Seen CVEs set grows unbounded (consider periodic cleanup for long-running deployments)
+
+**Subprocess (nuclei):**
+- Validation has a configurable timeout (default 60s)
+- Temp files are cleaned up in `finally` blocks
+- Binary availability checked once at init, not on every call
+
+### 5. Integration Notes
+
+**How the orchestrator sends targets:**
+1. Add to `default_targets` in `config.yaml`
+2. Push to Redis set `global:targets`: `SADD global:targets https://target.com`
+3. Include in per-CVE task: `{"targets": ["https://target.com"]}`
+
+**How results are consumed:**
+- Results are pushed to `results:incoming` (configurable)
+- Each result follows the required schema with mandatory `data` field:
+  ```json
+  {
+    "module": "nuclei_sniper",
+    "target": "https://target.com",
+    "status": "COMPLETED",
+    "errors": [],
+    "data": {
+      "findings": [],
+      "stats": {"cve_id": "CVE-2021-44228", "targets_scanned": 1},
+      "template_cve": "CVE-2021-44228"
+    }
+  }
+Queue flow:
+
+text
+
+queue:nuclei_sniper → generator → queue:nuclei_sniper:validate → validator → queue:nuclei_sniper:execute → executor → queue:recon
+Status tracking:
+
+Each CVE has a status key: nuclei_sniper:status:<CVE_ID>
+Status progression: DISCOVERED → QUEUED → GENERATING → GENERATED/FALLBACK → VALIDATING → CORRECTING → VALIDATED/VALIDATION_FAILED → EXECUTING → SCANNING/FAILED
+All status strings are UPPERCASE per the critical architecture rule.
