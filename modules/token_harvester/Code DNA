@@ -1,0 +1,328 @@
+Testing
+See the Post-Mortem section for detailed test instructions.
+
+text
+
+
+---
+
+## 📊 Deep Dive Post-Mortem (DNA)
+
+### ASCII Data Flow Diagram
+text
+
+                       CENTAUR-JARVIS TOKEN HARVESTER — DATA FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ USER'S BROWSER │
+│ (configured to use proxy at 127.0.0.1:8080, mitmproxy CA installed) │
+└───────────────────┬───────────────────────────────────────▲────────────┘
+│ HTTP/HTTPS Request │ HTTP/HTTPS Response
+│ ┌──────────────────┐ │ ┌──────────────────┐
+│ │ Authorization: │ │ │ Set-Cookie: ... │
+│ │ Bearer eyJ... │ │ │ X-CSRF-Token: │
+│ │ Cookie: sess=abc │ │ │ Body: {"token":} │
+│ └──────────────────┘ │ └──────────────────┘
+▼ │
+┌───────────────────────────────────────────────────────────────────────┐
+│ MITMPROXY (mitmdump) │
+│ listening on 127.0.0.1:8080 │
+│ │
+│ ┌─────────────────────────────────────────────────────────────────┐ │
+│ │ TokenHarvesterAddon (mitm_addon.py) │ │
+│ │ │ │
+│ │ ┌──────────────────┐ ┌──────────────────────────────┐ │ │
+│ │ │ request(flow) │ │ response(flow) │ │ │
+│ │ │ │ │ │ │ │
+│ │ │ ① Auth header ──┤ │ ① Set-Cookie headers ──────┤ │ │
+│ │ │ ② Cookie header ┤ │ ② CSRF response headers ───┤ │ │
+│ │ │ ③ CSRF headers ─┤ │ ③ Auth header (echo) ──────┤ │ │
+│ │ │ │ │ ④ JSON body → walk_json() ──┤ │ │
+│ │ │ │ │ ⑤ Regex → HTML CSRF forms ──┤ │ │
+│ │ └──────────┬───────┘ └────────────────┬─────────────┘ │ │
+│ │ │ │ │ │
+│ │ └──────────────┬─────────────────────┘ │ │
+│ │ │ │ │
+│ │ ▼ │ │
+│ │ ┌─────────────────────────┐ │ │
+│ │ │ _TokenRecord │ │ │
+│ │ │ (dataclass instance) │ │ │
+│ │ │ │ │ │
+│ │ │ id, type, value, │ │ │
+│ │ │ domain, path, expiry, │ │ │
+│ │ │ secure, httponly, │ │ │
+│ │ │ created_at, last_seen, │ │ │
+│ │ │ source, raw_name │ │ │
+│ │ └────────────┬────────────┘ │ │
+│ └───────────────────────────┼─────────────────────────────────────┘ │
+└───────────────────────────────┼───────────────────────────────────────┘
+│
+▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ RedisTokenStore │
+│ │
+│ ┌──────────────────┐ │
+│ │ _ensure_connection│──── ping ────▶ Redis OK? │
+│ └──────┬───────────┘ │
+│ │ │
+│ ├── YES ──▶ store_token() │
+│ │ ┌───────────────────────────────────────────┐ │
+│ │ │ Redis Pipeline (atomic): │ │
+│ │ │ HSET token:{domain}:{hash_id} {fields} │ │
+│ │ │ EXPIREAT token:{domain}:{hash_id} {exp} │ │
+│ │ │ SADD tokens:domain:{domain} {key} │ │
+│ │ │ SADD tokens:domains {domain} │ │
+│ │ └───────────────────────────────────────────┘ │
+│ │ │
+│ └── NO ───▶ buffer_token() │
+│ ┌───────────────────────────────────────────┐ │
+│ │ deque (maxlen=5000) │ │
+│ │ TokenRecord appended │ │
+│ │ On reconnect → flush_buffer() │ │
+│ └───────────────────────────────────────────┘ │
+│ │
+│ Background Thread (daemon): │
+│ ┌──────────────────────────────────────────────────────────────┐ │
+│ │ Every 300s: cleanup_expired() │ │
+│ │ → Scan all domains → remove keys where expiry < now │ │
+│ └──────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────┘
+│
+▼
+┌───────────────────────────────────────────────────────────────────────┐
+│ REDIS DATABASE │
+│ │
+│ ┌─────────────────────────────────────────────────────────────────┐ │
+│ │ KEY: token:example.com:a1b2c3d4e5f6 │ │
+│ │ TYPE: hash │ │
+│ │ FIELDS: │ │
+│ │ type = "jwt" │ │
+│ │ value = "eyJhbGciOiJIUzI1NiIs..." │ │
+│ │ domain = "example.com" │ │
+│ │ path = "/" │ │
+│ │ expiry = "1700000000.0" │ │
+│ │ secure = "1" │ │
+│ │ httponly = "0" │ │
+│ │ created_at = "1699900000.0" │ │
+│ │ last_seen = "1699950000.0" │ │
+│ │ source = "request_header" │ │
+│ │ raw_name = "Authorization" │ │
+│ │ TTL: expires at 1700000000 │ │
+│ └─────────────────────────────────────────────────────────────────┘ │
+│ │
+│ ┌─────────────────────────────────────────────────┐ │
+│ │ KEY: tokens:domains (SET) │ │
+│ │ MEMBERS: "example.com", "api.target.io", ... │ │
+│ └─────────────────────────────────────────────────┘ │
+│ │
+│ ┌──────────────────────────────────────────────────────┐ │
+│ │ KEY: tokens:domain:example.com (SET) │ │
+│ │ MEMBERS: "token:example.com:a1b2c3d4e5f6", │ │
+│ │ "token:example.com:f6e5d4c3b2a1", ... │ │
+│ └──────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────┘
+│
+┌───────────────────┼───────────────────┐
+│ │ │
+▼ ▼ ▼
+┌───────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ RECON MODULE │ │ FUZZER MODULE │ │ EXPLOIT MODULE │
+│ │ │ │ │ │
+│ get_tokens_for │ │ get_tokens_for │ │ get_tokens_for │
+│ domain("target") │ │ domain("target")│ │ domain("target")│
+│ │ │ │ │ │
+│ → Uses JWT in │ │ → Uses cookie │ │ → Uses bearer │
+│ Authorization │ │ for session │ │ for exploit │
+│ header │ │ replay │ │ validation │
+└───────────────────┘ └─────────────────┘ └─────────────────┘
+
+text
+
+
+### Token Extraction Logic — Deep Explanation
+
+#### 1. Request Phase (`request(flow)`)
+
+When the browser sends a request through the proxy:
+
+| Source | Extraction | Token Type | Notes |
+|--------|-----------|------------|-------|
+| `Authorization: Bearer eyJ...` | Split on space, extract token value | `jwt` if passes JWT heuristic, else `bearer` | JWT expiry decoded from `exp` claim |
+| `Authorization: Basic dXNlcjpwYXNz` | Store full header value | `basic` | Base64 of `user:pass` |
+| `Cookie: session=abc; token=xyz` | Split on `;`, then on `=` | `cookie` (or `jwt` if value is JWT) | No attributes available in request Cookie header |
+| `X-CSRF-Token: abc123` | Direct header read | `csrf` | Checked against list of known CSRF header names |
+
+#### 2. Response Phase (`response(flow)`)
+
+When the server responds:
+
+| Source | Extraction | Token Type | Notes |
+|--------|-----------|------------|-------|
+| `Set-Cookie: session=abc; HttpOnly; Secure; Path=/api; Domain=.example.com; Expires=...` | Full attribute parsing via `_parse_cookie_attributes()` | `cookie` (or `jwt`) | All attributes (HttpOnly, Secure, Path, Domain, Expires, SameSite, Max-Age) preserved |
+| Response CSRF headers | Same as request phase | `csrf` | |
+| JSON body: `{"access_token": "eyJ..."}` | Recursive JSON walk (`_walk_json`) | Determined by key name and value analysis | Depth-limited to 10 levels; key matched against configurable set |
+| HTML body: `<input name="csrf" value="...">` | Regex pattern matching | `csrf` | Configurable patterns in `config.yaml` |
+
+#### 3. JWT Detection Heuristic
+
+A value is classified as JWT if:
+1. Contains exactly 3 parts separated by `.`
+2. First two parts are valid base64url-encoded JSON
+
+If detected as JWT, the `exp` claim is extracted for automatic expiry management.
+
+#### 4. Deduplication Strategy
+
+Tokens are deduplicated using a deterministic Redis key:
+token:{domain}:{md5(type + raw_name + sha256(value)[:16])[:12]}
+
+text
+
+
+This ensures:
+- Same token seen again → updates `last_seen` (HSET overwrites)
+- Different token with same name → new key (value hash differs)
+- Refreshed JWT for same purpose → new key (new value)
+
+### Edge Cases Mitigated
+
+| # | Edge Case | Mitigation | Code Location |
+|---|-----------|------------|---------------|
+| 1 | **Expired cookies** | `is_expired()` check before return; cleanup thread removes from Redis | `_TokenRecord.is_expired()`, `cleanup_expired()` |
+| 2 | **Multiple tokens, same domain** | All stored with unique keys; retrieval returns all; optional path/type filter | `_make_key()` uses value hash |
+| 3 | **JWTs without `exp` claim** | `expiry=0.0` means "no expiry"; default Redis TTL (7d) still applies | `_decode_jwt_expiry()` returns 0.0 |
+| 4 | **HTTPS without CA installed** | mitmproxy shows error; we log at WARNING level; no crash | mitmproxy handles this natively |
+| 5 | **Cookie without `Domain` attribute** | Falls back to `request_domain` from URL | `_process_set_cookie()`: `domain = attrs["domain"] if attrs["domain"] else request_domain` |
+| 6 | **Cookie `Path` attribute** | Stored; `get_tokens()` filters by path using `startswith()` | `get_tokens()` path filtering |
+| 7 | **Large number of tokens** | Redis SETs/HASHes are O(1) for add/get; domain index enables O(n) only per domain | SADD/HSET are O(1) |
+| 8 | **Redis down** | In-memory `deque` buffer (max 5000); auto-flush on reconnect | `_buffer_token()`, `_flush_buffer()` |
+| 9 | **mitmproxy fails to start** | Logged at CRITICAL; addon set to None; hooks become no-ops | `_initialize()` exception handler |
+| 10 | **User closes browser** | Harvester continues; no socket dependency on browser | By design |
+| 11 | **Token in non-JSON body** | Regex patterns scan HTML for CSRF tokens | `_extract_regex_tokens()` |
+| 12 | **Very large response bodies** | Size limit (default 1MB); skip if exceeded | `max_response_body_size` config |
+| 13 | **Malformed JSON in body** | `json.loads()` wrapped in try/except; fails silently | `_extract_json_tokens()` |
+| 14 | **Deeply nested JSON** | Recursion depth limited to 10 | `_walk_json(depth)` guard |
+| 15 | **Redis connection drops mid-operation** | Pipeline failures caught; token buffered; reconnect on next call | `_ensure_connection()` |
+| 16 | **Memory buffer overflow** | `deque(maxlen=N)` auto-evicts oldest; logged at WARNING | `_buffer_token()` |
+| 17 | **`Max-Age` overrides `Expires`** | Parser applies `max-age` after `expires` | `_parse_cookie_attributes()` |
+| 18 | **Cookie value is empty** | Skipped (`if not value: continue`) | `_process_cookie_header()`, `_process_set_cookie()` |
+| 19 | **Concurrent access to buffer** | `threading.Lock` protects buffer operations | `_buffer_lock` |
+| 20 | **Token logging security risk** | `log_token_values: false` by default; values masked in logs | `_mask_token()`, config flag |
+| 21 | **Stale keys in domain index** | Cleaned during `get_tokens()` and periodic cleanup | Stale key removal in both paths |
+| 22 | **`redis-py` not installed** | Graceful degradation to memory-only mode | `redis_lib is None` check |
+| 23 | **Shared module import failures** | Fallback to stdlib `logging` and internal `_TokenRecord` | try/except imports |
+| 24 | **Domain with leading dot** | Stripped: `.example.com` → `example.com` | `lstrip(".")` in cookie parser |
+| 25 | **Multiple `Set-Cookie` headers** | `get_all("Set-Cookie")` retrieves all | mitmproxy's `headers.get_all()` |
+
+### Remaining Loopholes & Future Improvements
+
+| # | Loophole / Gap | Severity | Proposed Fix |
+|---|---------------|----------|-------------|
+| 1 | **Encrypted token values** — If the app encrypts tokens before sending, we store the ciphertext | Low | Out of scope; would need app-specific decryption |
+| 2 | **WebSocket tokens** — Tokens exchanged via WebSocket frames are not captured | Medium | Implement `websocket_message()` hook |
+| 3 | **Token rotation without new value** — If server rotates token but value hash stays same (unlikely) | Very Low | Store all versions with timestamp |
+| 4 | **gRPC / Protobuf responses** — Binary protocols won't be parsed by JSON/regex extractors | Medium | Add protobuf decoder support |
+| 5 | **OAuth2 PKCE flows** — Authorization code in URL params not captured | Medium | Add `flow.request.query` parsing |
+| 6 | **Single Redis instance** — No Redis Sentinel/Cluster support | Low (for local tool) | Add connection string support |
+| 7 | **No encryption at rest** — Token values stored in plaintext in Redis | Medium | Add AES encryption option for stored values |
+| 8 | **Token classification accuracy** — Some custom tokens may be misclassified | Low | Add ML-based token classifier |
+| 9 | **Rate limiting on storage** — Extremely chatty sites could flood Redis | Low | Add per-domain rate limiting |
+| 10 | **No token correlation** — Can't link access_token to its refresh_token | Low | Add correlation ID or session grouping |
+
+### Performance Considerations
+
+| Aspect | Design Decision | Impact |
+|--------|----------------|--------|
+| **Redis pipeline** | Atomic pipeline for each token (HSET + EXPIREAT + 2× SADD) | 1 RTT per token instead of 4 |
+| **Domain index sets** | `tokens:domain:{domain}` enables O(1) membership + O(n) scan per domain only | Avoids `KEYS *` full-scan |
+| **Deterministic key hashing** | MD5 of `type:name:value_hash` → dedup without scanning | O(1) upsert |
+| **Response body size limit** | 1MB default; configurable | Prevents memory spike on large downloads |
+| **JSON walk depth limit** | 10 levels max | Prevents stack overflow on pathological inputs |
+| **Memory buffer** | `deque(maxlen=5000)` with lock | Bounded memory; O(1) append/popleft |
+| **Cleanup thread** | Daemon thread; 5-min interval; per-domain scan | Low CPU; scales with domain count, not token count |
+| **Ignored domains set** | Python `set` with suffix matching | Fast skip for CDNs/analytics |
+| **Compiled regex patterns** | Pre-compiled in `__init__` | Avoids re-compilation per response |
+
+### Integration Notes
+
+**How other modules fetch tokens:**
+
+```python
+# In any module (recon, fuzzer, exploit):
+from modules.token_harvester import get_tokens_for_domain
+
+def make_authenticated_request(domain, url):
+    tokens = get_tokens_for_domain(domain)
+    
+    headers = {}
+    cookies = {}
+    
+    for token in tokens:
+        if token["type"] == "jwt" or token["type"] == "bearer":
+            headers["Authorization"] = f"Bearer {token['value']}"
+        elif token["type"] == "basic":
+            headers["Authorization"] = token["value"]
+        elif token["type"] == "cookie":
+            cookies[token["raw_name"]] = token["value"]
+        elif token["type"] == "csrf":
+            headers["X-CSRF-Token"] = token["value"]
+    
+    # Use requests/httpx with headers and cookies
+    response = requests.get(url, headers=headers, cookies=cookies)
+Redis key structure for direct queries:
+
+text
+
+redis-cli> SMEMBERS tokens:domains
+1) "juice-shop.example.com"
+2) "api.target.io"
+
+redis-cli> SMEMBERS tokens:domain:juice-shop.example.com
+1) "token:juice-shop.example.com:a1b2c3d4e5f6"
+2) "token:juice-shop.example.com:f6e5d4c3b2a1"
+
+redis-cli> HGETALL token:juice-shop.example.com:a1b2c3d4e5f6
+ 1) "type"        2) "jwt"
+ 3) "value"       4) "eyJhbGciOiJIUzI1NiIs..."
+ 5) "domain"      6) "juice-shop.example.com"
+ 7) "path"        8) "/"
+ 9) "expiry"     10) "1700000000.0"
+11) "secure"     12) "1"
+13) "httponly"   14) "0"
+15) "created_at" 16) "1699900000.0"
+17) "last_seen"  18) "1699950000.0"
+19) "source"     20) "request_header"
+21) "raw_name"   22) "Authorization"
+Manual Testing Procedure
+Bash
+
+# Terminal 1: Start Redis
+redis-server
+
+# Terminal 2: Start Token Harvester
+mitmdump -s modules/token_harvester/mitm_addon.py --listen-port 8080
+
+# Terminal 3: (Optional) Start OWASP Juice Shop
+docker run -d -p 3000:3000 bkimminich/juice-shop
+
+# Browser: Configure proxy to 127.0.0.1:8080
+# Browser: Visit http://mitm.it → install CA certificate
+# Browser: Visit http://localhost:3000 → login → browse around
+
+# Terminal 4: Verify
+redis-cli SMEMBERS "tokens:domains"
+redis-cli SMEMBERS "tokens:domain:localhost"
+redis-cli KEYS "token:*"
+redis-cli HGETALL "token:localhost:$(redis-cli SRANDMEMBER tokens:domain:localhost)"
+
+# Check stats (Python):
+python -c "
+from modules.token_harvester import get_token_stats, get_all_harvested_domains, get_tokens_for_domain
+print('Domains:', get_all_harvested_domains())
+print('Stats:', get_token_stats())
+for d in get_all_harvested_domains():
+    tokens = get_tokens_for_domain(d)
+    print(f'{d}: {len(tokens)} tokens')
+    for t in tokens[:3]:
+        print(f'  [{t[\"type\"]}] {t[\"raw_name\"]}: {t[\"value\"][:40]}...')
