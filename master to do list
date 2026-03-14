@@ -1,0 +1,92 @@
+ Updated Master To-Do List — Centaur-Jarvis v1.0
+🧠 Core Principles (Always Active)
+✅ 360° Edge Case Anticipation — Har module design mein network failures, WAF blocks, rate limits, hardware constraints, cross-platform paths, data corruption sab socha gaya hai.
+✅ No Silent Failures — Har error log hota hai, console pe scream hota hai, Discord alert bheja jata hai. Kabhi except: pass nahi.
+✅ Plug-and-Play Modularity — Har module independent, ek fail to baki chalte rahe. Communication sirf Redis ke through.
+✅ Performance First — Multi-threading, async, connection pooling, GPU (via Ollama) use karte hain, but rate limits ka dhyan rakhte hain.
+✅ Graceful Shutdown — Ctrl+C daba to current tasks finish kare, state save kare, phir exit. Restart pe recover ho.
+✅ Idempotency & Recovery — Har task ek unique ID. Duplicate ignore. Crash ke baad wahi se resume.
+✅ Telemetry & Logging — Har state change, task routing, error — sab log file + console. Critical alerts Discord pe.
+✅ Human-in-the-Loop — AI sirf 90% drudgity (recon, analysis, payload generation) karega. Exploitation aur validation human karega (Burp ya manual).
+
+🚦 Phase-Wise Progress
+Phase 0: Foundation & Infrastructure
+Module	Status	Remarks
+Project Structure (folders)	✅ Done	tree output matches blueprint
+Core Orchestrator	✅ Done	Working, with task routing, rate limiting, circuit breaker, heartbeat
+Shared Schemas	✅ Done	Updated with all enums, fields, to_dict/from_dict
+Shared Logger	✅ Done	JSON logger with file/console, worker_id injection
+Redis Setup	✅ Done	Local Redis running, tested
+Tailscale Setup	🔜 Later	For cloud workers (optional)
+Phase 1: Authentication & Token Management
+Module	Status	Remarks
+Token Harvester	✅ DNA & Code Ready	Mitmproxy addon, extracts JWTs/cookies, stores in Redis. Integration pending? (Code present, but not yet run in main pipeline?)
+Token Manager	🔜 Later	Will use harvester's tokens
+Phase 2: AI Integration
+Module	Status	Remarks
+AI Router	🟡 DNA Received	Code pending from Claude. Should detect local Ollama, multiple models, external APIs (Gemini, DeepSeek, Groq), context-based routing, rate limiting, fallback
+Local LLM Wrapper	🟡 Part of AI Router	Ollama client with model selection
+Gemini API Client	🟡 Part of AI Router	Free tier support, rate limiting
+DeepSeek API Client	🟡 Part of AI Router	Cheap API, code generation focus
+Groq API Client	🟡 Part of AI Router	Fast inference, free tier
+Phase 3: Reconnaissance (Deterministic)
+Module	Status	Remarks
+Recon Workers Base	✅ Done	Worker.py implemented, with heartbeat, resource monitor, result buffering
+Subfinder Task	✅ Done	In tasks.py, tested
+Httpx Task	✅ Done	In tasks.py, tested
+Nuclei Task	✅ Done	In tasks.py, tested with -jsonl fix
+Naabu Task	🟡 Code Ready	In tasks.py, but tool not installed? (naabu missing warning)
+Parsers	✅ Done	In parsers.py, line-by-line JSON parsing with fallbacks
+Phase 4: Vulnerability Analysis Modules
+Module	Status	Remarks
+IDOR/BOLA State Analyzer	🔜 Planned	Pure Python, compare two sessions, differential analysis
+Smart Fuzzer (AI-powered)	🔜 Planned	AI generates contextual payloads, executes with rate limiting, iterative improvement on failure
+Nuclei Sniper (Self-Healing)	🔜 Planned	Monitor GitHub/Twitter for new CVEs, AI writes templates, validate with retry loop
+Playwright SPA Renderer	🔜 Planned	Headless browser to extract XHR/fetch endpoints from SPAs
+OAST Listener (Private Interactsh)	🔜 Planned	Out-of-band detection server
+RAG (Vector DB)	🔜 Planned	Store HackTricks, PortSwigger, etc. for contextual AI
+Phase 4B: Chain Attack & State Management
+Module	Status	Remarks
+Knowledge Graph	🔜 Planned	Store relationships (endpoints, credentials, sessions)
+AI Chain Planner	🔜 Planned	Suggest next steps based on current graph
+Chain Executor	🔜 Planned	Execute multi-step sequences with state persistence
+Phase 5: Reporting & UI
+Module	Status	Remarks
+Reporting Module	✅ Done	Generates HTML/JSON/Text reports, findings aggregation, edge cases handled
+CVSS v4 Scoring	🔜 Planned	Automatically calculate scores based on finding data
+Steps to Reproduce	🔜 Planned	Include in report (from AI or manual)
+POC Screenshots	🔜 Planned	Possibly via Playwright
+CLI Interactive Menu	🔜 Planned	As shown in initial prompt
+Web Dashboard	🔜 Optional	Flask + Redis for real-time monitoring
+Phase 6: Testing & Optimization
+Module	Status	Remarks
+Integration Tests	🔜 Planned	Pytest for each module
+Performance Benchmarking	🔜 Planned	Measure throughput, latency
+Juice Shop / PortSwigger Tests	🟡 Partial	Juice Shop tested (info finding), more labs to try
+🔍 Missing / Not Yet Implemented Features (360° Vision Check)
+Feature	Priority	Why Needed
+AI Router with multiple free LLMs	🔴 High	Without this, no AI-powered modules can run.
+RAG (Vector DB)	🔴 High	For contextual payload generation (HackTricks, PortSwigger).
+AI-generated obfuscated payloads on error	🔴 High	Smart fuzzer needs this to bypass WAF.
+AI verification of findings	🔴 High	Reduce false positives.
+Smart fallback: if local LLM unavailable → external API → deterministic mode	🔴 High	Ensures tool runs even without AI.
+Rate limiting per API key (Redis-backed)	🔴 High	Essential for external APIs to avoid bans.
+Respect robots.txt and rate limits from target	🟡 Medium	Currently rate limiting is per-domain token bucket, but should adapt to 429 responses.
+Cross-module token usage	🟡 Medium	Recon workers should use tokens from harvester for authenticated scans.
+Knowledge Graph for state persistence	🔴 High	For chain attacks and contextual awareness.
+Chain Attack Executor	🔴 High	Multi-step exploitation (e.g., SQLi → credentials → login → admin).
+Nuclei self-healing with error feedback	🟡 Medium	AI retries on validation failure.
+Playwright for dynamic endpoint discovery	🟡 Medium	Needed for modern SPAs.
+OAST server for blind vulnerabilities	🟡 Medium	Detect blind XSS, SSRF, etc.
+Private Interactsh integration	🟡 Medium	OAST with correlation.
+CVSS v4 scoring in reports	🟡 Medium	Professional reports.
+Interactive CLI menu	🟡 Medium	User-friendly interface.
+Discord alerts for critical events	🟡 Medium	Already in orchestrator, but should be extended to all modules.
+Graceful shutdown with state save	✅ Done	Orchestrator handles it.
+Cross-platform paths	✅ Done	Not needed (Kali only), but we use pathlib anyway.
+Resource monitoring (RAM, CPU)	✅ Done	In recon worker.
+Tool auto-installation	🔴 High	Worker should auto-install missing tools (go install) on first run.
+Configuration via env vars + YAML	✅ Done	In most modules.
+Logging to Discord	✅ Done	In orchestrator, needs to be in other modules.
+Deduplication of tasks	✅ Done	In orchestrator.
+Circuit breaker for targets	✅ Done	In orchestrator.
