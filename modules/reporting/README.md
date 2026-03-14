@@ -42,6 +42,16 @@ ORCHESTRATOR INTEGRATION:
 └──────────────┘     └───────────────┘     └──────────────────┘
 
 
+modules/reporting/
+├── __init__.py
+├── __main__.py
+├── generator.py
+├── formatters.py
+├── config.yaml
+├── templates/
+│   └── report.html.j2
+└── README.md
+
 
 # 📝 Centaur-Jarvis Reporting Module
 
