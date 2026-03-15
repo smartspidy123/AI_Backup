@@ -1,427 +1,407 @@
 """
-Process Manager
-===============
-Manages backend service lifecycle (auto mode).
-Ensures Redis, orchestrator, workers, and other services are running.
+Process Manager – Starts, monitors, and stops background services.
 
-Edge cases handled:
-    #1  – Redis not running → attempt to start; clear error if fails
-    #2  – Service crashes during scan → detect via heartbeat; restart
-    #16 – Hung child processes after Ctrl+C → SIGKILL after timeout
-    #18 – No permissions to start services → suggest manual mode
+Handles:
+- Starting orchestrator, recon workers, fuzzer, sniper as subprocesses
+- Health monitoring with auto-restart on crash
+- Graceful shutdown with SIGTERM → wait → SIGKILL
+- PID file management to prevent duplicate instances
+- Manual mode support (skip process management)
+
+Edge Cases Handled:
+- Service binary not found → clear error
+- Permission denied → suggest --manual
+- Zombie processes → force kill
+- PID file stale → detect and clean
+- Child processes hanging on shutdown → escalate to SIGKILL
 """
 
-import logging
 import os
-import signal
-import subprocess
 import sys
+import signal
 import time
+import subprocess
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional, List, Any
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
-logger = logging.getLogger("cli.process_manager")
 
-try:
-    import psutil
-
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-    logger.warning("psutil not installed. Process management capabilities reduced.")
-
-try:
-    import redis as redis_lib
-
-    HAS_REDIS = True
-except ImportError:
-    HAS_REDIS = False
-    logger.warning("redis library not installed.")
+@dataclass
+class ProcessInfo:
+    """Metadata for a managed subprocess."""
+    name: str
+    module: str
+    process: Optional[subprocess.Popen] = None
+    pid: Optional[int] = None
+    required: bool = True
+    restart_on_crash: bool = True
+    max_restarts: int = 3
+    restart_count: int = 0
+    started_at: Optional[str] = None
+    status: str = "STOPPED"  # STOPPED, RUNNING, CRASHED, RESTARTING
 
 
 class ProcessManager:
-    """Start, monitor, and stop backend services."""
+    """
+    Manages background service processes for Centaur-Jarvis.
+    
+    In non-manual mode, starts all configured services as subprocesses.
+    In manual mode, assumes services are already running externally.
+    """
 
-    def __init__(self, config: dict):
-        self._config = config
-        proc_cfg = config.get("processes", {})
-        self._heartbeat_timeout = proc_cfg.get("heartbeat_timeout", 30)
-        self._kill_timeout = proc_cfg.get("kill_timeout", 10)
-        self._pid_dir = Path(
-            os.path.expanduser(proc_cfg.get("pid_directory", "~/.centaur/pids"))
-        )
-        self._pid_dir.mkdir(parents=True, exist_ok=True)
+    PID_DIR = Path(".jarvis_pids")
 
-        self._services_config: Dict[str, dict] = proc_cfg.get("services", {})
-        self._managed_processes: Dict[str, subprocess.Popen] = {}
-        self._redis_client: Optional[redis_lib.Redis] = None
+    def __init__(self, config: Dict[str, Any], manual_mode: bool = False, logger=None):
+        self.config = config
+        self.manual_mode = manual_mode
+        self.logger = logger
+        self._processes: Dict[str, ProcessInfo] = {}
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._errors: List[Dict[str, Any]] = []
 
-        redis_cfg = config.get("redis", {})
-        self._redis_host = redis_cfg.get("host", "127.0.0.1")
-        self._redis_port = redis_cfg.get("port", 6379)
-        self._redis_db = redis_cfg.get("db", 0)
+        if not manual_mode:
+            self._init_pid_directory()
 
-    # ------------------------------------------------------------------
-    # Redis
-    # ------------------------------------------------------------------
-    def _get_redis(self) -> Optional[redis_lib.Redis]:
-        """Get or create a Redis client."""
-        if self._redis_client is not None:
-            try:
-                self._redis_client.ping()
-                return self._redis_client
-            except Exception:
-                self._redis_client = None
+    def _log(self, level: str, msg: str):
+        if self.logger:
+            getattr(self.logger, level, self.logger.info)(msg)
 
-        if not HAS_REDIS:
-            return None
-
-        redis_cfg = self._config.get("redis", {})
+    def _init_pid_directory(self):
+        """Create PID directory, handle permission issues."""
         try:
-            client = redis_lib.Redis(
-                host=self._redis_host,
-                port=self._redis_port,
-                db=self._redis_db,
-                socket_timeout=redis_cfg.get("socket_timeout", 5),
-                retry_on_timeout=redis_cfg.get("retry_on_timeout", True),
-                decode_responses=True,
-            )
-            client.ping()
-            self._redis_client = client
-            return client
-        except Exception:
-            return None
+            self.PID_DIR.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            self._log("error", f"[ProcessManager] Cannot create PID directory: {self.PID_DIR}")
+            self._errors.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": f"Permission denied creating {self.PID_DIR}",
+                "suggestion": "Run with --manual mode or fix permissions",
+            })
 
-    def ensure_redis(self) -> bool:
+    def check_duplicate_instance(self) -> bool:
         """
-        Ensure Redis is running.
-        Edge case #1: If not running, attempt to start it.
+        Check if another CLI instance is already running.
+        Returns True if duplicate detected.
         """
-        client = self._get_redis()
-        if client is not None:
-            logger.info("Redis is already running at %s:%d", self._redis_host, self._redis_port)
-            return True
-
-        logger.warning("Redis not responding. Attempting to start... (Edge case #1)")
-
-        # Try starting Redis via common methods
-        start_commands = [
-            ["redis-server", "--daemonize", "yes", "--port", str(self._redis_port)],
-            ["docker", "run", "-d", "--name", "centaur-redis", "-p", f"{self._redis_port}:6379", "redis:alpine"],
-        ]
-
-        for cmd in start_commands:
+        pid_file = self.PID_DIR / "cli_master.pid"
+        if pid_file.exists():
             try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if result.returncode == 0:
-                    # Wait for Redis to be ready
-                    for _ in range(10):
-                        time.sleep(1)
-                        client = self._get_redis()
-                        if client is not None:
-                            logger.info("Redis started successfully via: %s", " ".join(cmd))
-                            return True
-            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-                logger.debug("Command %s failed: %s", cmd[0], exc)
-                continue
+                old_pid = int(pid_file.read_text().strip())
+                # Check if process is actually alive
+                try:
+                    os.kill(old_pid, 0)
+                    # Process exists
+                    self._log(
+                        "error",
+                        f"[ProcessManager] Another instance running (PID {old_pid}). "
+                        f"Kill it first or delete {pid_file}",
+                    )
+                    return True
+                except OSError:
+                    # Stale PID file – process is dead
+                    self._log(
+                        "info",
+                        f"[ProcessManager] Stale PID file found (PID {old_pid}). Cleaning up.",
+                    )
+                    pid_file.unlink(missing_ok=True)
+                    return False
+            except (ValueError, OSError):
+                pid_file.unlink(missing_ok=True)
+                return False
 
-        logger.error(
-            "CRITICAL: Cannot start Redis. Install Redis and start it manually, "
-            "or use Docker. (Edge case #1)"
-        )
+        # Write our PID
+        try:
+            pid_file.write_text(str(os.getpid()))
+        except OSError:
+            pass
         return False
 
-    # ------------------------------------------------------------------
-    # Service management
-    # ------------------------------------------------------------------
-    def ensure_service(self, service_name: str) -> bool:
+    def start_services(self, required_phases: List[str]) -> Dict[str, str]:
         """
-        Ensure a named service is running.
-        1. Check Redis first (edge case #1)
-        2. Check heartbeat in Redis
-        3. Check PID file
-        4. If not running, start it
-
-        Edge case #18: No permissions → return False with clear message.
+        Start background services needed for the scan phases.
+        
+        Args:
+            required_phases: List of phases like ["recon", "fuzzing", "sniper"]
+            
+        Returns:
+            Dict mapping service name → status
         """
-        # Always ensure Redis first
-        if service_name != "redis" and not self.ensure_redis():
-            logger.error("Cannot ensure service '%s' without Redis.", service_name)
-            return False
+        if self.manual_mode:
+            self._log("info", "[ProcessManager] Manual mode – skipping service startup")
+            return {"mode": "manual", "status": "SKIPPED"}
 
-        svc_cfg = self._services_config.get(service_name)
-        if svc_cfg is None:
-            logger.error("Unknown service '%s'. Check config.yaml.", service_name)
-            return False
+        process_configs = self.config.get("processes", {})
+        results = {}
 
-        # Check if already running via heartbeat
-        if self._check_heartbeat(service_name, svc_cfg):
-            logger.info("Service '%s' is running (heartbeat OK).", service_name)
-            return True
+        # Always start orchestrator
+        if "orchestrator" in process_configs:
+            results["orchestrator"] = self._start_process(
+                "orchestrator", process_configs["orchestrator"]
+            )
 
-        # Check if we have a managed process for it
-        if service_name in self._managed_processes:
-            proc = self._managed_processes[service_name]
-            if proc.poll() is None:  # still running
-                logger.info("Service '%s' process is alive (PID %d).", service_name, proc.pid)
-                return True
-            else:
-                logger.warning(
-                    "Service '%s' process exited (code %s). Restarting... (Edge case #2)",
-                    service_name,
-                    proc.returncode,
+        # Start phase-specific workers
+        phase_worker_map = {
+            "recon": "recon_worker",
+            "fuzzing": "fuzzer_worker",
+            "sniper": "sniper_worker",
+        }
+
+        for phase in required_phases:
+            worker_name = phase_worker_map.get(phase)
+            if worker_name and worker_name in process_configs:
+                results[worker_name] = self._start_process(
+                    worker_name, process_configs[worker_name]
                 )
 
-        # Check PID file
-        pid = self._read_pid_file(service_name)
-        if pid and self._is_process_alive(pid):
-            logger.info(
-                "Service '%s' found via PID file (PID %d).", service_name, pid
-            )
-            return True
+        # Start monitor thread
+        self._start_monitor()
+        return results
 
-        # Start the service
-        return self._start_service(service_name, svc_cfg)
+    def _start_process(self, name: str, proc_config: Dict[str, Any]) -> str:
+        """Start a single background process."""
+        module = proc_config.get("module", "")
+        required = proc_config.get("required", False)
+        restart_on_crash = proc_config.get("restart_on_crash", True)
+        max_restarts = proc_config.get("max_restarts", 3)
 
-    def _check_heartbeat(self, service_name: str, svc_cfg: dict) -> bool:
-        """Check service heartbeat in Redis."""
-        client = self._get_redis()
-        if client is None:
-            return False
-
-        heartbeat_key = svc_cfg.get("heartbeat_key", f"heartbeat:{service_name}")
-        try:
-            last_beat = client.get(heartbeat_key)
-            if last_beat is None:
-                return False
-            # Check if heartbeat is recent
-            from datetime import datetime, timezone
-
-            beat_time = datetime.fromisoformat(last_beat)
-            elapsed = (datetime.now(timezone.utc) - beat_time).total_seconds()
-            return elapsed < self._heartbeat_timeout
-        except Exception as exc:
-            logger.debug("Heartbeat check failed for %s: %s", service_name, exc)
-            return False
-
-    def _start_service(self, service_name: str, svc_cfg: dict) -> bool:
-        """
-        Start a service as a background subprocess.
-        Edge case #18: Handle permission errors.
-        """
-        command = svc_cfg.get("command", "")
-        if not command:
-            logger.error("No command configured for service '%s'.", service_name)
-            return False
-
-        cmd_parts = command.split()
-        logger.info("Starting service '%s': %s", service_name, command)
+        info = ProcessInfo(
+            name=name,
+            module=module,
+            required=required,
+            restart_on_crash=restart_on_crash,
+            max_restarts=max_restarts,
+        )
 
         try:
-            # Create log file for the service
-            log_dir = Path(os.path.expanduser("~/.centaur/logs"))
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"{service_name}.log"
+            cmd = [sys.executable, "-m", module]
+            self._log("info", f"[ProcessManager] Starting {name}: {' '.join(cmd)}")
 
-            with open(log_file, "a") as lf:
-                proc = subprocess.Popen(
-                    cmd_parts,
-                    stdout=lf,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,  # detach from parent
-                    preexec_fn=os.setsid if sys.platform != "win32" else None,
-                )
-
-            self._managed_processes[service_name] = proc
-            self._write_pid_file(service_name, proc.pid)
-
-            # Wait a moment for the service to initialize
-            time.sleep(3)
-
-            # Verify it's still running
-            if proc.poll() is not None:
-                logger.error(
-                    "Service '%s' exited immediately (code %s). Check %s for details.",
-                    service_name,
-                    proc.returncode,
-                    log_file,
-                )
-                return False
-
-            logger.info(
-                "Service '%s' started (PID %d). Logs: %s",
-                service_name,
-                proc.pid,
-                log_file,
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,  # Detach from parent's signal group
             )
-            return True
 
-        except PermissionError as exc:
-            logger.error(
-                "Permission denied starting '%s': %s. (Edge case #18) "
-                "Run with appropriate permissions or use --manual.",
-                service_name,
-                exc,
-            )
-            return False
-        except FileNotFoundError as exc:
-            logger.error(
-                "Command not found for '%s': %s. Check config.yaml.", service_name, exc
-            )
-            return False
-        except OSError as exc:
-            logger.error("OS error starting '%s': %s", service_name, exc)
-            return False
+            info.process = proc
+            info.pid = proc.pid
+            info.status = "RUNNING"
+            info.started_at = datetime.now(timezone.utc).isoformat()
 
-    # ------------------------------------------------------------------
-    # PID files
-    # ------------------------------------------------------------------
-    def _write_pid_file(self, service_name: str, pid: int) -> None:
-        pid_file = self._pid_dir / f"{service_name}.pid"
-        try:
-            pid_file.write_text(str(pid))
-        except OSError as exc:
-            logger.warning("Cannot write PID file %s: %s", pid_file, exc)
-
-    def _read_pid_file(self, service_name: str) -> Optional[int]:
-        pid_file = self._pid_dir / f"{service_name}.pid"
-        if not pid_file.exists():
-            return None
-        try:
-            return int(pid_file.read_text().strip())
-        except (ValueError, OSError):
-            return None
-
-    def _remove_pid_file(self, service_name: str) -> None:
-        pid_file = self._pid_dir / f"{service_name}.pid"
-        pid_file.unlink(missing_ok=True)
-
-    # ------------------------------------------------------------------
-    # Process utilities
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _is_process_alive(pid: int) -> bool:
-        if not HAS_PSUTIL:
+            # Write PID file
             try:
-                os.kill(pid, 0)
-                return True
-            except (ProcessLookupError, PermissionError):
-                return False
+                (self.PID_DIR / f"{name}.pid").write_text(str(proc.pid))
+            except OSError:
+                pass
 
-        try:
-            proc = psutil.Process(pid)
-            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return False
+            with self._lock:
+                self._processes[name] = info
 
-    # ------------------------------------------------------------------
-    # Health check (called periodically during scan)
-    # ------------------------------------------------------------------
-    def health_check(self) -> Dict[str, bool]:
-        """
-        Check all managed services' health.
-        Edge case #2: Detect crashes; return status dict.
-        """
-        status = {}
-        for svc_name in self._managed_processes:
-            proc = self._managed_processes[svc_name]
-            alive = proc.poll() is None
-            status[svc_name] = alive
-            if not alive:
-                logger.warning(
-                    "Service '%s' has crashed (exit code %s). (Edge case #2)",
-                    svc_name,
-                    proc.returncode,
-                )
-        return status
+            self._log("info", f"[ProcessManager] {name} started (PID {proc.pid})")
+            return "RUNNING"
 
-    def restart_crashed(self) -> List[str]:
-        """Attempt to restart any crashed managed services."""
-        restarted = []
-        for svc_name, proc in list(self._managed_processes.items()):
-            if proc.poll() is not None:  # process has exited
-                svc_cfg = self._services_config.get(svc_name, {})
-                logger.info("Attempting to restart crashed service '%s'...", svc_name)
-                if self._start_service(svc_name, svc_cfg):
-                    restarted.append(svc_name)
-                else:
-                    logger.error("Failed to restart '%s'.", svc_name)
-        return restarted
+        except FileNotFoundError:
+            error_msg = f"Module '{module}' not found. Is it installed?"
+            self._log("error", f"[ProcessManager] {error_msg}")
+            info.status = "CRASHED"
+            self._errors.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "service": name,
+                "error": error_msg,
+            })
+            with self._lock:
+                self._processes[name] = info
+            return "FAILED" if required else "SKIPPED"
 
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-    def stop_all(self) -> None:
+        except PermissionError:
+            error_msg = f"Permission denied starting {name}. Use --manual mode."
+            self._log("error", f"[ProcessManager] {error_msg}")
+            info.status = "CRASHED"
+            self._errors.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "service": name,
+                "error": error_msg,
+            })
+            with self._lock:
+                self._processes[name] = info
+            return "FAILED"
+
+        except Exception as e:
+            error_msg = f"Unexpected error starting {name}: {e}"
+            self._log("error", f"[ProcessManager] {error_msg}")
+            info.status = "CRASHED"
+            self._errors.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "service": name,
+                "error": error_msg,
+            })
+            with self._lock:
+                self._processes[name] = info
+            return "FAILED"
+
+    def _start_monitor(self):
+        """Start background thread to monitor process health."""
+        self._stop_event.clear()
+
+        def _monitor_loop():
+            while not self._stop_event.is_set():
+                self._stop_event.wait(timeout=5)
+                if self._stop_event.is_set():
+                    break
+                self._check_processes()
+
+        self._monitor_thread = threading.Thread(
+            target=_monitor_loop, daemon=True, name="process-monitor"
+        )
+        self._monitor_thread.start()
+
+    def _check_processes(self):
+        """Check if managed processes are still alive; restart if needed."""
+        with self._lock:
+            for name, info in self._processes.items():
+                if info.status != "RUNNING" or info.process is None:
+                    continue
+
+                retcode = info.process.poll()
+                if retcode is not None:
+                    # Process exited
+                    info.status = "CRASHED"
+                    self._log(
+                        "error",
+                        f"[ProcessManager] {name} crashed (exit code {retcode})",
+                    )
+                    self._errors.append({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "service": name,
+                        "error": f"Crashed with exit code {retcode}",
+                    })
+
+                    if info.restart_on_crash and info.restart_count < info.max_restarts:
+                        info.restart_count += 1
+                        info.status = "RESTARTING"
+                        self._log(
+                            "warning",
+                            f"[ProcessManager] Restarting {name} "
+                            f"(attempt {info.restart_count}/{info.max_restarts})",
+                        )
+                        # Release lock for restart
+                        # We'll handle restart outside the loop to avoid holding lock
+                        threading.Thread(
+                            target=self._restart_process,
+                            args=(name,),
+                            daemon=True,
+                        ).start()
+
+    def _restart_process(self, name: str):
+        """Restart a crashed process."""
+        time.sleep(2)  # Brief delay before restart
+        with self._lock:
+            info = self._processes.get(name)
+            if not info:
+                return
+
+        proc_config = self.config.get("processes", {}).get(name, {})
+        result = self._start_process(name, proc_config)
+        if result == "RUNNING":
+            self._log("info", f"[ProcessManager] {name} restarted successfully")
+
+    def stop_all(self, timeout: int = 10):
         """
-        Gracefully stop all managed services.
-        Edge case #16: SIGKILL after timeout for hung processes.
+        Gracefully stop all managed processes.
+        SIGTERM → wait(timeout) → SIGKILL for stragglers.
         """
-        if not self._managed_processes:
-            logger.debug("No managed processes to stop.")
+        self._stop_event.set()
+
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=3)
+
+        with self._lock:
+            processes_to_stop = list(self._processes.values())
+
+        if not processes_to_stop:
             return
 
-        logger.info("Stopping %d managed service(s)...", len(self._managed_processes))
+        self._log("info", "[ProcessManager] Stopping all services...")
 
-        # Phase 1: Send SIGTERM to all
-        for svc_name, proc in self._managed_processes.items():
-            if proc.poll() is None:
-                logger.info("Sending SIGTERM to '%s' (PID %d)", svc_name, proc.pid)
+        # Phase 1: SIGTERM
+        for info in processes_to_stop:
+            if info.process and info.process.poll() is None:
                 try:
-                    if sys.platform != "win32":
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                    else:
-                        proc.terminate()
-                except (ProcessLookupError, PermissionError, OSError) as exc:
-                    logger.debug("SIGTERM to '%s' failed: %s", svc_name, exc)
+                    self._log("info", f"[ProcessManager] Sending SIGTERM to {info.name} (PID {info.pid})")
+                    os.killpg(os.getpgid(info.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        info.process.terminate()
+                    except Exception:
+                        pass
 
-        # Phase 2: Wait for graceful exit
-        deadline = time.time() + self._kill_timeout
-        for svc_name, proc in self._managed_processes.items():
-            remaining = max(0, deadline - time.time())
-            try:
-                proc.wait(timeout=remaining)
-                logger.info("Service '%s' exited gracefully.", svc_name)
-            except subprocess.TimeoutExpired:
-                # Phase 3: Force kill (edge case #16)
-                logger.warning(
-                    "Service '%s' did not stop within %ds. Sending SIGKILL. (Edge case #16)",
-                    svc_name,
-                    self._kill_timeout,
-                )
+        # Phase 2: Wait
+        deadline = time.time() + timeout
+        for info in processes_to_stop:
+            if info.process and info.process.poll() is None:
+                remaining = max(0.1, deadline - time.time())
                 try:
-                    if sys.platform != "win32":
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    else:
-                        proc.kill()
-                    proc.wait(timeout=5)
-                except Exception as exc:
-                    logger.error("Cannot kill '%s': %s", svc_name, exc)
+                    info.process.wait(timeout=remaining)
+                    self._log("info", f"[ProcessManager] {info.name} stopped gracefully")
+                except subprocess.TimeoutExpired:
+                    pass
 
-            self._remove_pid_file(svc_name)
+        # Phase 3: SIGKILL for stragglers
+        for info in processes_to_stop:
+            if info.process and info.process.poll() is None:
+                try:
+                    self._log(
+                        "warning",
+                        f"[ProcessManager] Force-killing {info.name} (PID {info.pid})",
+                    )
+                    os.killpg(os.getpgid(info.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        info.process.kill()
+                    except Exception:
+                        pass
 
-        self._managed_processes.clear()
-        logger.info("All managed services stopped.")
+                self._errors.append({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "service": info.name,
+                    "error": "Required SIGKILL to stop",
+                })
 
-    def stop_service(self, service_name: str) -> bool:
-        """Stop a single managed service."""
-        proc = self._managed_processes.get(service_name)
-        if proc is None or proc.poll() is not None:
-            self._remove_pid_file(service_name)
-            return True
+            info.status = "STOPPED"
 
-        try:
-            proc.terminate()
-            proc.wait(timeout=self._kill_timeout)
-        except subprocess.TimeoutExpired:
-            logger.warning("Force-killing '%s'. (Edge case #16)", service_name)
-            proc.kill()
-            proc.wait(timeout=5)
+        # Clean PID files
+        self._clean_pid_files()
+        self._log("info", "[ProcessManager] All services stopped")
 
-        self._remove_pid_file(service_name)
-        del self._managed_processes[service_name]
-        return True
+    def _clean_pid_files(self):
+        """Remove PID files on shutdown."""
+        if self.PID_DIR.exists():
+            for pid_file in self.PID_DIR.glob("*.pid"):
+                try:
+                    pid_file.unlink()
+                except OSError:
+                    pass
+
+    def get_status(self) -> Dict[str, Dict[str, Any]]:
+        """Get status of all managed processes."""
+        with self._lock:
+            status = {}
+            for name, info in self._processes.items():
+                alive = False
+                if info.process:
+                    alive = info.process.poll() is None
+                status[name] = {
+                    "status": info.status if alive else ("STOPPED" if info.status == "STOPPED" else "CRASHED"),
+                    "pid": info.pid,
+                    "restarts": info.restart_count,
+                    "started_at": info.started_at,
+                }
+            return status
+
+    def get_errors(self) -> List[Dict[str, Any]]:
+        """Return accumulated process errors."""
+        return list(self._errors)
