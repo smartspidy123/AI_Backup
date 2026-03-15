@@ -120,3 +120,65 @@ Edge Cases
 6	Redis connection lost	In-memory buffer (max 100 results) + retry
 7	Invalid task JSON	Logged and skipped
 8	SIGTERM during processing	Finish current endpoint, drain buffer, exit
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         IDOR ANALYZER MODULE WORKFLOW                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Redis queue:idor                                                               │
+│       │                                                                         │
+│       ▼                                                                         │
+│  ┌──────────────┐    ┌───────────────────┐    ┌─────────────────────┐           │
+│  │  analyzer.py  │───▶│ session_manager.py │───▶│  Fetch/Validate     │           │
+│  │  (Worker)     │    │  get_session_auth  │    │  Auth Tokens        │           │
+│  └──────┬───────┘    └───────────────────┘    └─────────────────────┘           │
+│         │                                                                       │
+│         ▼                                                                       │
+│  ┌──────────────────────────────────────────────┐                               │
+│  │  For each endpoint in task.endpoints:         │                               │
+│  │                                               │                               │
+│  │  ┌─────────────┐       ┌─────────────┐       │                               │
+│  │  │ HTTP Request │       │ HTTP Request │       │                               │
+│  │  │  as User A   │       │  as User B   │       │                               │
+│  │  └──────┬──────┘       └──────┬──────┘       │                               │
+│  │         │                      │              │                               │
+│  │         ▼                      ▼              │                               │
+│  │  ┌──────────────────────────────────┐        │                               │
+│  │  │     comparators.py               │        │                               │
+│  │  │  compare_responses(resp_a,resp_b)│        │                               │
+│  │  │                                  │        │                               │
+│  │  │  1. Normalize (strip dynamic)    │        │                               │
+│  │  │  2. Compare status codes         │        │                               │
+│  │  │  3. Compare headers              │        │                               │
+│  │  │  4. Compare body (JSON deep diff)│        │                               │
+│  │  │  5. Similarity ratio check       │        │                               │
+│  │  │  6. IDOR suspicion heuristics    │        │                               │
+│  │  └──────────┬───────────────────────┘        │                               │
+│  │             │                                 │                               │
+│  │             ▼                                 │                               │
+│  │  ┌─────────────────────┐                     │                               │
+│  │  │ Finding generated?  │──Yes──▶ Append      │                               │
+│  │  │ (suspicious=True)   │        to findings  │                               │
+│  │  └─────────────────────┘                     │                               │
+│  └──────────────────────────────────────────────┘                               │
+│         │                                                                       │
+│         ▼                                                                       │
+│  ┌────────────────────────────────────┐                                         │
+│  │  Build TaskResult                  │                                         │
+│  │  {                                 │                                         │
+│  │    "task_id": "...",               │                                         │
+│  │    "status": "COMPLETED"/"FAILED", │                                         │
+│  │    "data": {                       │                                         │
+│  │      "findings": [...],            │                                         │
+│  │      "stats": {...}                │                                         │
+│  │    }                               │                                         │
+│  │  }                                 │                                         │
+│  └────────────┬───────────────────────┘                                         │
+│               │                                                                 │
+│               ▼                                                                 │
+│      Redis results:incoming                                                     │
+│                                                                                 │
+│  Telemetry: JSON logs at every stage                                            │
+│  Shutdown: SIGTERM → finish current endpoint → drain buffer → exit              │
+│  Fallback: memory buffer (max 100) if Redis write fails                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
