@@ -1,729 +1,886 @@
 """
-Scan Controller
-===============
-Orchestrates the phased scan lifecycle:
-    Phase 1: Recon      (subfinder, httpx, nuclei)
-    Phase 2: Fuzzing    (smart_fuzzer for discovered endpoints)
-    Phase 3: Sniper     (nuclei sniper for fresh CVEs)
-    Phase 4: Reporting  (auto-generated after completion)
+Scan Controller – Orchestrates phased scanning, task pushing, and activity tracking.
 
-Communicates with backend services exclusively via Redis queues.
-Tracks progress, collects findings, and supports pause/resume.
+Responsibilities:
+- Parse target(s) from CLI input (single URL, file, multiple)
+- Execute scan phases in order: recon → fuzzing → sniper → reporting
+- Push tasks to Redis queues for workers to consume
+- Track current activities, events, errors in thread-safe collections
+- Listen for results from Redis and update state accordingly
+- Interface between CLI/display and backend workers
+- Handle AI router calls with proper fallback
 
-Edge cases handled:
-    #3  – Network partition / Redis unreachable → retry with backoff + buffer
-    #4  – Target unreachable → log, continue, mark as failed
-    #5  – AI provider fails → fallback to deterministic scans
-    #6  – RAG timeout → proceed without context
-    #8  – Resume: skip completed tasks via dedup
-    #15 – Stuck tasks during pause → timeout monitor will requeue
+Edge Cases Handled:
+- Target file not found → error and exit
+- Target unreachable → log error, continue with others
+- Redis unavailable → retry with backoff, show error
+- AI/RAG unavailable → fallback to deterministic scans
+- Empty results from workers → warning event
+- Phase timeout → move to next phase with partial results
 """
 
 import json
-import logging
-import threading
 import time
 import uuid
+import threading
+import re
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Callable
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
-
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
-
-logger = logging.getLogger("cli.scan_controller")
+from collections import deque
+from urllib.parse import urlparse
 
 try:
-    import redis as redis_lib
-
-    HAS_REDIS = True
+    import redis
 except ImportError:
-    HAS_REDIS = False
-    logger.error("redis library not installed. ScanController cannot function.")
+    redis = None
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    HAS_TENACITY = True
+except ImportError:
+    HAS_TENACITY = False
+
+
+# Status constants (UPPERCASE per architecture rule)
+STATUS_PENDING = "PENDING"
+STATUS_RUNNING = "RUNNING"
+STATUS_COMPLETED = "COMPLETED"
+STATUS_FAILED = "FAILED"
+STATUS_PAUSED = "PAUSED"
+STATUS_PARTIAL = "PARTIAL"
+
+
+class ThreadSafeDeque:
+    """Thread-safe bounded deque for events/activities/errors."""
+
+    def __init__(self, maxlen: int = 50):
+        self._deque = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def append(self, item):
+        with self._lock:
+            self._deque.append(item)
+
+    def get_all(self) -> List:
+        with self._lock:
+            return list(self._deque)
+
+    def clear(self):
+        with self._lock:
+            self._deque.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._deque)
+
+    def remove_by_id(self, task_id: str):
+        with self._lock:
+            self._deque = deque(
+                [item for item in self._deque if item.get("task_id") != task_id],
+                maxlen=self._deque.maxlen,
+            )
 
 
 class ScanController:
     """
-    Master scan lifecycle manager.
-
-    Pushes tasks to Redis queues, polls for completion, collects findings,
-    and progresses through configured phases.
+    Master scan orchestration controller.
+    
+    Manages the full scan lifecycle: target parsing → task submission →
+    result collection → phase progression → report generation.
     """
 
-    # Phase ordering
-    ALL_PHASES = ["recon", "fuzzing", "sniper", "reporting"]
+    # Redis queue names (matching existing modules)
+    QUEUE_RECON = "jarvis:queue:recon"
+    QUEUE_FUZZER = "jarvis:queue:fuzzer"
+    QUEUE_SNIPER = "jarvis:queue:sniper"
+    QUEUE_RESULTS = "jarvis:results"
+    SCAN_STATE_KEY = "jarvis:scan:{scan_id}:state"
 
     def __init__(
         self,
-        scan_id: str,
-        targets: List[str],
-        profile_name: str,
-        profile_config: dict,
-        config: dict,
-        state_manager=None,
-        resume_state: Optional[dict] = None,
+        redis_config: Dict[str, Any],
+        profile_config: Dict[str, Any],
+        display_config: Dict[str, Any],
+        logger=None,
     ):
-        self.scan_id = scan_id
-        self.targets = targets
-        self.profile_name = profile_name
+        self.redis_config = redis_config
         self.profile_config = profile_config
-        self._config = config
-        self._state_manager = state_manager
+        self.display_config = display_config
+        self.logger = logger
 
-        # Scan state
-        self.phases_completed: List[str] = []
-        self.current_phase: Optional[str] = None
-        self.findings: List[dict] = []
-        self.errors: List[dict] = []
-        self.started_at: str = datetime.now(timezone.utc).isoformat()
-        self.paused_at: Optional[str] = None
+        # Scan metadata
+        self.scan_id: str = ""
+        self.targets: List[str] = []
+        self.profile_name: str = "quick"
+        self.start_time: Optional[float] = None
+        self.current_phase: str = ""
+        self.status: str = STATUS_PENDING
 
-        # Task tracking
-        self._pending_tasks: List[dict] = []  # tasks not yet pushed to Redis
-        self._queued_task_ids: Set[str] = set()  # task IDs pushed to queue
-        self._processing_task_ids: Set[str] = set()  # task IDs being processed
-        self._completed_task_ids: Set[str] = set()  # task IDs finished
-        self._failed_task_ids: Set[str] = set()
+        # Thread-safe tracking collections
+        self.activities = ThreadSafeDeque(
+            maxlen=display_config.get("max_activities", 8)
+        )
+        self.events = ThreadSafeDeque(
+            maxlen=display_config.get("max_events", 50)
+        )
+        self.errors = ThreadSafeDeque(
+            maxlen=display_config.get("max_errors", 20)
+        )
 
-        # Stats
-        self._stats = {
+        # Statistics
+        self._stats_lock = threading.Lock()
+        self.stats = {
             "tasks_pushed": 0,
             "tasks_completed": 0,
             "tasks_failed": 0,
             "findings_count": 0,
-            "requests_sent": 0,
             "ai_calls": 0,
             "rag_snippets": 0,
         }
 
-        # Discovered data (from recon phase)
-        self._discovered_endpoints: List[str] = []
-        self._discovered_subdomains: List[str] = []
+        # Tool summaries
+        self._summaries_lock = threading.Lock()
+        self.tool_summaries = {
+            "ports_open": [],
+            "subdomains": 0,
+            "endpoints": 0,
+            "payloads_sent": 0,
+            "interesting_responses": 0,
+            "templates_matched": 0,
+            "critical_findings": 0,
+            "technologies": [],
+        }
 
-        # Shutdown / pause control
-        self._shutdown_requested = threading.Event()
-        self._lock = threading.Lock()
+        # Task tracking
+        self._tasks_lock = threading.Lock()
+        self._pending_tasks: Dict[str, Dict[str, Any]] = {}
+        self._completed_tasks: Dict[str, Dict[str, Any]] = {}
 
-        # Redis
-        self._redis: Optional[redis_lib.Redis] = None
-        self._redis_cfg = config.get("redis", {})
+        # Redis client
+        self._redis: Optional[Any] = None
+        self._result_listener_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
-        # Phase progress for dashboard
-        self._phase_progress: Dict[str, dict] = {}
+        # Callbacks
+        self._on_complete_callbacks: List[Callable] = []
 
-        # Load resume state if available
-        if resume_state:
-            self._restore_state(resume_state)
+    def _log(self, level: str, msg: str):
+        if self.logger:
+            getattr(self.logger, level, self.logger.info)(msg)
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-    @property
-    def is_paused(self) -> bool:
-        return self._shutdown_requested.is_set() and self.current_phase is not None
+    # ── Redis Connection ──────────────────────────────────────────────
 
-    @property
-    def is_completed(self) -> bool:
-        enabled_phases = self.profile_config.get("phases", ["recon"])
-        return all(p in self.phases_completed for p in enabled_phases)
-
-    @property
-    def status(self) -> str:
-        if self.is_completed:
-            return "COMPLETED"
-        if self.is_paused:
-            return "PAUSED"
-        if self._shutdown_requested.is_set():
-            return "SHUTTING_DOWN"
-        if self.current_phase:
-            return "RUNNING"
-        return "IDLE"
-
-    @property
-    def elapsed_seconds(self) -> float:
-        start = datetime.fromisoformat(self.started_at)
-        now = datetime.now(timezone.utc)
-        return (now - start).total_seconds()
-
-    # ------------------------------------------------------------------
-    # Redis connection
-    # ------------------------------------------------------------------
-    def _get_redis(self) -> Optional[redis_lib.Redis]:
-        """Get or create Redis client with connection validation."""
-        if self._redis is not None:
-            try:
-                self._redis.ping()
-                return self._redis
-            except Exception:
-                self._redis = None
-
-        if not HAS_REDIS:
-            logger.error("redis library not available.")
-            return None
-
-        try:
-            client = redis_lib.Redis(
-                host=self._redis_cfg.get("host", "127.0.0.1"),
-                port=self._redis_cfg.get("port", 6379),
-                db=self._redis_cfg.get("db", 0),
-                socket_timeout=self._redis_cfg.get("socket_timeout", 5),
-                retry_on_timeout=self._redis_cfg.get("retry_on_timeout", True),
-                decode_responses=True,
-            )
-            client.ping()
-            self._redis = client
-            return client
-        except Exception as exc:
-            logger.error("Cannot connect to Redis: %s (Edge case #3)", exc)
-            return None
-
-    # ------------------------------------------------------------------
-    # Task ID generation
-    # ------------------------------------------------------------------
-    def _make_task_id(self, task_type: str, target: str, extra: str = "") -> str:
-        """Generate a deterministic task ID for deduplication."""
-        raw = f"{self.scan_id}:{task_type}:{target}:{extra}"
-        return f"task_{uuid.uuid5(uuid.NAMESPACE_URL, raw).hex[:16]}"
-
-    # ------------------------------------------------------------------
-    # Push task to Redis (with retry)
-    # ------------------------------------------------------------------
-    @retry(
-        retry=retry_if_exception_type(Exception),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=1, max=30),
-        reraise=True,
-    )
-    def _push_task(self, queue: str, task: dict) -> bool:
-        """
-        Push a task to a Redis queue.
-        Edge case #3: Retry with exponential backoff.
-        """
-        client = self._get_redis()
-        if client is None:
-            raise ConnectionError("Redis unavailable")
-
-        task_json = json.dumps(task, default=str)
-        client.rpush(queue, task_json)
-
-        task_id = task.get("task_id", "unknown")
-        # Also set a status key
-        client.set(f"task:status:{task_id}", "QUEUED")
-
-        with self._lock:
-            self._queued_task_ids.add(task_id)
-            self._stats["tasks_pushed"] += 1
-
-        logger.debug("Pushed task %s to %s", task_id, queue)
-        return True
-
-    def _push_task_safe(self, queue: str, task: dict) -> bool:
-        """Push task with graceful failure handling."""
-        try:
-            return self._push_task(queue, task)
-        except Exception as exc:
-            logger.error(
-                "Failed to push task after retries: %s. Buffering. (Edge case #3)", exc
-            )
-            with self._lock:
-                self._pending_tasks.append({"queue": queue, "task": task})
-                self._add_error(f"Task push failed: {exc}")
+    def _connect_redis(self) -> bool:
+        """Establish Redis connection with retries."""
+        if redis is None:
+            self._add_error("Redis Python package not installed. pip install redis")
             return False
 
-    # ------------------------------------------------------------------
-    # Poll task statuses
-    # ------------------------------------------------------------------
-    def _poll_task_statuses(self) -> Dict[str, str]:
-        """
-        Poll Redis for status of all queued/processing tasks.
-        Returns dict of task_id → status.
-        """
-        client = self._get_redis()
-        if client is None:
-            return {}
+        host = self.redis_config.get("host", "127.0.0.1")
+        port = self.redis_config.get("port", 6379)
+        db = self.redis_config.get("db", 0)
+        password = self.redis_config.get("password")
+        timeout = self.redis_config.get("socket_timeout", 5)
+        max_retries = self.redis_config.get("max_retries", 3)
+        retry_delay = self.redis_config.get("retry_delay", 2)
 
-        statuses = {}
-        task_ids = list(self._queued_task_ids | self._processing_task_ids)
-
-        if not task_ids:
-            return {}
-
-        # Use pipeline for efficiency
-        pipe = client.pipeline(transaction=False)
-        for tid in task_ids:
-            pipe.get(f"task:status:{tid}")
-
-        try:
-            results = pipe.execute()
-            for tid, result in zip(task_ids, results):
-                statuses[tid] = result or "UNKNOWN"
-        except Exception as exc:
-            logger.warning("Status poll failed: %s", exc)
-
-        return statuses
-
-    def _consume_results(self) -> List[dict]:
-        """
-        Consume results from the results queue.
-        Returns list of result dicts.
-        """
-        client = self._get_redis()
-        if client is None:
-            return []
-
-        results = []
-        results_key = f"results:{self.scan_id}"
-
-        try:
-            # Non-blocking LPOP in a batch
-            while True:
-                raw = client.lpop(results_key)
-                if raw is None:
-                    break
-                try:
-                    result = json.loads(raw)
-                    results.append(result)
-                except json.JSONDecodeError:
-                    logger.warning("Invalid JSON in results queue: %s", raw[:100])
-        except Exception as exc:
-            logger.warning("Results consumption failed: %s", exc)
-
-        return results
-
-    def _process_result(self, result: dict) -> None:
-        """Process a single task result."""
-        task_id = result.get("task_id", "unknown")
-        status = result.get("status", "UNKNOWN").upper()
-        data = result.get("data", {})
-
-        with self._lock:
-            self._queued_task_ids.discard(task_id)
-            self._processing_task_ids.discard(task_id)
-
-            if status == "COMPLETED":
-                self._completed_task_ids.add(task_id)
-                self._stats["tasks_completed"] += 1
-
-                # Extract findings
-                findings = data.get("findings", [])
-                if findings:
-                    for finding in findings:
-                        finding["scan_id"] = self.scan_id
-                        finding["discovered_at"] = datetime.now(timezone.utc).isoformat()
-                    self.findings.extend(findings)
-                    self._stats["findings_count"] += len(findings)
-                    logger.info(
-                        "Task %s completed with %d finding(s).", task_id, len(findings)
-                    )
-
-                # Extract discovered endpoints/subdomains
-                endpoints = data.get("endpoints", [])
-                subdomains = data.get("subdomains", [])
-                self._discovered_endpoints.extend(endpoints)
-                self._discovered_subdomains.extend(subdomains)
-
-                # Track stats from result
-                self._stats["requests_sent"] += data.get("requests_sent", 0)
-                self._stats["ai_calls"] += data.get("ai_calls", 0)
-                self._stats["rag_snippets"] += data.get("rag_snippets", 0)
-
-            elif status == "FAILED":
-                self._failed_task_ids.add(task_id)
-                self._stats["tasks_failed"] += 1
-                error_msg = data.get("error", result.get("error", "Unknown error"))
-                self._add_error(f"Task {task_id} failed: {error_msg}")
-                logger.warning("Task %s failed: %s", task_id, error_msg)
-            else:
-                # PROCESSING or other intermediate status
-                self._processing_task_ids.add(task_id)
-
-    # ------------------------------------------------------------------
-    # Wait for phase completion
-    # ------------------------------------------------------------------
-    def _wait_for_phase(self, phase_name: str, timeout: int = 3600) -> bool:
-        """
-        Wait until all tasks for the current phase are done.
-        Returns True if all completed, False if shutdown requested or timeout.
-        """
-        start_time = time.time()
-        poll_interval = 2  # seconds
-        auto_save_interval = self._state_manager.auto_save_interval if self._state_manager else 30
-        last_auto_save = time.time()
-
-        while not self._shutdown_requested.is_set():
-            # Check timeout
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                logger.warning("Phase '%s' timed out after %ds.", phase_name, timeout)
-                self._add_error(f"Phase {phase_name} timed out")
-                return False
-
-            # Consume and process results
-            results = self._consume_results()
-            for result in results:
-                self._process_result(result)
-
-            # Update statuses from Redis
-            statuses = self._poll_task_statuses()
-            with self._lock:
-                for tid, s in statuses.items():
-                    s_upper = s.upper()
-                    if s_upper == "COMPLETED" and tid not in self._completed_task_ids:
-                        # Result may come through results queue; this is backup
-                        pass
-                    elif s_upper == "PROCESSING":
-                        self._queued_task_ids.discard(tid)
-                        self._processing_task_ids.add(tid)
-                    elif s_upper == "FAILED" and tid not in self._failed_task_ids:
-                        self._failed_task_ids.add(tid)
-                        self._stats["tasks_failed"] += 1
-
-            # Check if all tasks are done
-            with self._lock:
-                pending_count = len(self._queued_task_ids) + len(self._processing_task_ids)
-
-            if pending_count == 0 and not self._pending_tasks:
-                logger.info("Phase '%s' completed.", phase_name)
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._redis = redis.Redis(
+                    host=host,
+                    port=port,
+                    db=db,
+                    password=password,
+                    socket_timeout=timeout,
+                    socket_connect_timeout=timeout,
+                    decode_responses=True,
+                    retry_on_timeout=True,
+                )
+                self._redis.ping()
+                self._add_event("info", f"Connected to Redis ({host}:{port})")
                 return True
 
-            # Update phase progress for dashboard
-            with self._lock:
-                total = (
-                    len(self._queued_task_ids)
-                    + len(self._processing_task_ids)
-                    + len(self._completed_task_ids)
-                    + len(self._failed_task_ids)
+            except redis.ConnectionError as e:
+                msg = (
+                    f"Redis connection failed (attempt {attempt}/{max_retries}): {e}"
                 )
-                done = len(self._completed_task_ids) + len(self._failed_task_ids)
-                self._phase_progress[phase_name] = {
-                    "total": total,
-                    "done": done,
-                    "pending": pending_count,
-                }
+                self._log("error", f"[ScanController] {msg}")
+                if attempt < max_retries:
+                    time.sleep(retry_delay * attempt)
+                else:
+                    self._add_error(
+                        f"Redis not reachable at {host}:{port}. "
+                        f"Start Redis or use --manual mode."
+                    )
+                    return False
+            except Exception as e:
+                self._add_error(f"Unexpected Redis error: {e}")
+                return False
 
-            # Auto-save state periodically
-            if time.time() - last_auto_save > auto_save_interval:
-                if self._state_manager:
-                    self._state_manager.save_state(self.get_state())
-                    last_auto_save = time.time()
+    # ── Target Parsing ────────────────────────────────────────────────
 
-            time.sleep(poll_interval)
+    def parse_targets(self, target_input: str) -> List[str]:
+        """
+        Parse target(s) from CLI input.
+        
+        Accepts:
+        - Single URL: "https://example.com"
+        - File path: "targets.txt" (one URL per line)
+        - Comma-separated: "https://a.com,https://b.com"
+        
+        Returns list of validated URLs.
+        """
+        targets = []
 
-        # Shutdown requested
-        logger.info("Shutdown requested during phase '%s'.", phase_name)
-        return False
+        # Check if it's a file
+        target_path = Path(target_input)
+        if target_path.exists() and target_path.is_file():
+            try:
+                content = target_path.read_text().strip()
+                raw_targets = [line.strip() for line in content.splitlines() if line.strip()]
+                self._add_event("info", f"Loaded {len(raw_targets)} target(s) from {target_input}")
+            except OSError as e:
+                self._add_error(f"Cannot read target file '{target_input}': {e}")
+                return []
+        elif "," in target_input:
+            raw_targets = [t.strip() for t in target_input.split(",") if t.strip()]
+        else:
+            raw_targets = [target_input.strip()]
 
-    # ------------------------------------------------------------------
-    # Phase implementations
-    # ------------------------------------------------------------------
-    def _run_recon_phase(self) -> bool:
-        """Phase 1: Reconnaissance."""
-        self.current_phase = "recon"
-        logger.info("=== Phase 1: Recon ===")
+        # Validate and normalize URLs
+        for raw in raw_targets:
+            normalized = self._normalize_url(raw)
+            if normalized:
+                targets.append(normalized)
+            else:
+                self._add_error(f"Invalid target URL: '{raw}' – skipping")
 
+        if not targets:
+            self._add_error("No valid targets found. Provide a valid URL or file path.")
+
+        return targets
+
+    def _normalize_url(self, url: str) -> Optional[str]:
+        """Normalize and validate a URL."""
+        url = url.strip()
+        if not url:
+            return None
+
+        # Skip comments
+        if url.startswith("#"):
+            return None
+
+        # Add scheme if missing
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+
+        try:
+            parsed = urlparse(url)
+            if not parsed.hostname:
+                return None
+            # Basic hostname validation
+            if not re.match(r'^[a-zA-Z0-9._-]+$', parsed.hostname):
+                if not parsed.hostname.startswith('['):  # IPv6
+                    return None
+            return url
+        except Exception:
+            return None
+
+    # ── Scan Lifecycle ────────────────────────────────────────────────
+
+    def initialize_scan(
+        self,
+        target_input: str,
+        profile_name: str = "quick",
+        scan_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Initialize a new scan.
+        
+        Returns True if initialization succeeded.
+        """
+        self.scan_id = scan_id or f"SCAN_{uuid.uuid4().hex[:8].upper()}"
+        self.profile_name = profile_name
+        self.start_time = time.time()
+        self.status = STATUS_RUNNING
+
+        # Parse targets
+        self.targets = self.parse_targets(target_input)
+        if not self.targets:
+            self.status = STATUS_FAILED
+            return False
+
+        # Connect Redis
+        if not self._connect_redis():
+            self.status = STATUS_FAILED
+            return False
+
+        self._add_event(
+            "info",
+            f"Scan {self.scan_id} initialized | Profile: {profile_name} | "
+            f"Targets: {len(self.targets)}",
+        )
+
+        # Start result listener
+        self._start_result_listener()
+
+        return True
+
+    def restore_from_state(self, state: Dict[str, Any]) -> bool:
+        """
+        Restore scan from saved state for --resume.
+        
+        Returns True on successful restoration.
+        """
+        try:
+            self.scan_id = state.get("scan_id", self.scan_id)
+            self.targets = state.get("targets", [])
+            self.profile_name = state.get("profile_name", "quick")
+            self.current_phase = state.get("current_phase", "")
+            self.stats = state.get("stats", self.stats)
+            self.tool_summaries = state.get("tool_summaries", self.tool_summaries)
+
+            # Restore completed tasks (skip them on resume)
+            completed = state.get("completed_tasks", {})
+            with self._tasks_lock:
+                self._completed_tasks = completed
+
+            self.start_time = time.time()  # Reset timer for resumed scan
+            self.status = STATUS_RUNNING
+
+            if not self._connect_redis():
+                return False
+
+            self._start_result_listener()
+            self._add_event("info", f"Scan {self.scan_id} resumed from saved state")
+            self._add_event(
+                "info",
+                f"Skipping {len(completed)} already-completed tasks",
+            )
+            return True
+
+        except Exception as e:
+            self._add_error(f"Failed to restore state: {e}")
+            return False
+
+    def run_scan(self) -> bool:
+        """
+        Execute the scan phases sequentially.
+        
+        Returns True if scan completed (fully or partially).
+        """
+        phases = self.profile_config.get("phases", ["recon"])
+        self._add_event("info", f"Starting phased scan: {' → '.join(phases)}")
+
+        for phase in phases:
+            if self._stop_event.is_set():
+                self.status = STATUS_PAUSED
+                self._add_event("warning", "Scan paused by user")
+                return True
+
+            self.current_phase = phase
+            self._add_event("phase", f"━━━ Phase: {phase.upper()} ━━━")
+
+            try:
+                if phase == "recon":
+                    self._run_recon_phase()
+                elif phase == "fuzzing":
+                    self._run_fuzzing_phase()
+                elif phase == "sniper":
+                    self._run_sniper_phase()
+                else:
+                    self._add_error(f"Unknown phase: {phase}")
+                    continue
+
+                # Wait for phase to complete
+                self._wait_for_phase_completion(phase)
+
+            except Exception as e:
+                self._add_error(f"Phase '{phase}' failed: {e}")
+                continue
+
+        if not self._stop_event.is_set():
+            self.current_phase = "reporting"
+            self._add_event("phase", "━━━ Phase: REPORTING ━━━")
+            self._generate_report()
+            self.status = STATUS_COMPLETED
+            self._add_event("success", f"Scan {self.scan_id} completed!")
+
+        return True
+
+    # ── Phase Execution ───────────────────────────────────────────────
+
+    def _run_recon_phase(self):
+        """Push recon tasks to queue."""
         recon_tasks = self.profile_config.get("recon_tasks", ["nuclei"])
 
         for target in self.targets:
-            for task_type in recon_tasks:
-                task_id = self._make_task_id(f"RECON_{task_type.upper()}", target)
+            for tool in recon_tasks:
+                task_id = f"{self.scan_id}_{tool}_{uuid.uuid4().hex[:6]}"
 
-                # Skip if already completed (edge case #8 – resume dedup)
-                if task_id in self._completed_task_ids:
-                    logger.info("Skipping already-completed task %s (Edge case #8)", task_id)
-                    continue
+                # Skip if already completed (resume scenario)
+                with self._tasks_lock:
+                    if task_id in self._completed_tasks:
+                        continue
 
-                task = {
+                task_payload = {
                     "task_id": task_id,
                     "scan_id": self.scan_id,
-                    "type": f"RECON_{task_type.upper()}",
+                    "phase": "recon",
+                    "tool": tool,
                     "target": target,
-                    "params": {
-                        "tool": task_type,
-                        "profile": self.profile_name,
-                    },
+                    "status": STATUS_PENDING,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
 
-                self._push_task_safe("queue:recon", task)
+                if self._push_task(self.QUEUE_RECON, task_payload):
+                    self._add_activity(task_id, tool, f"scanning {target}")
+                    with self._stats_lock:
+                        self.stats["tasks_pushed"] += 1
 
-        # Wait for recon completion
-        timeout = self.profile_config.get("timeout", 3600)
-        return self._wait_for_phase("recon", timeout=timeout)
+    def _run_fuzzing_phase(self):
+        """Push fuzzing tasks based on recon findings."""
+        fuzzing_config = self.profile_config.get("fuzzing", {})
+        if not fuzzing_config.get("enabled", False):
+            self._add_event("info", "Fuzzing disabled in profile – skipping")
+            return
 
-    def _run_fuzzing_phase(self) -> bool:
-        """Phase 2: Smart Fuzzing."""
-        fuzzing_cfg = self.profile_config.get("fuzzing", {})
-        if not fuzzing_cfg.get("enabled", False):
-            logger.info("Fuzzing disabled in profile. Skipping.")
-            return True
+        vuln_types = fuzzing_config.get("vuln_types", ["xss", "sqli"])
+        max_iterations = fuzzing_config.get("max_iterations", 3)
 
-        self.current_phase = "fuzzing"
-        logger.info("=== Phase 2: Fuzzing ===")
-
-        vuln_types = fuzzing_cfg.get("vuln_types", ["xss", "sqli"])
-        max_iterations = fuzzing_cfg.get("max_iterations", 3)
-
-        # Use endpoints discovered in recon
-        endpoints = self._discovered_endpoints or self.targets
-
+        # Collect endpoints from recon results
+        endpoints = self._get_discovered_endpoints()
         if not endpoints:
-            logger.warning("No endpoints discovered for fuzzing. Using targets directly.")
-            endpoints = self.targets
+            self._add_event("warning", "No endpoints from recon – fuzzing has nothing to test")
+            return
 
         for endpoint in endpoints:
             for vuln_type in vuln_types:
-                task_id = self._make_task_id(f"FUZZ_{vuln_type.upper()}", endpoint)
+                task_id = f"{self.scan_id}_fuzz_{vuln_type}_{uuid.uuid4().hex[:6]}"
 
-                if task_id in self._completed_task_ids:
-                    logger.info("Skipping completed fuzz task %s (Edge case #8)", task_id)
-                    continue
+                with self._tasks_lock:
+                    if task_id in self._completed_tasks:
+                        continue
 
-                task = {
+                task_payload = {
                     "task_id": task_id,
                     "scan_id": self.scan_id,
-                    "type": f"FUZZ_{vuln_type.upper()}",
+                    "phase": "fuzzing",
+                    "vuln_type": vuln_type,
                     "target": endpoint,
-                    "params": {
-                        "vuln_type": vuln_type,
-                        "max_iterations": max_iterations,
-                        "profile": self.profile_name,
-                    },
+                    "max_iterations": max_iterations,
+                    "status": STATUS_PENDING,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
 
-                self._push_task_safe("queue:smart_fuzzer", task)
+                if self._push_task(self.QUEUE_FUZZER, task_payload):
+                    self._add_activity(task_id, f"fuzzer:{vuln_type}", f"testing {endpoint}")
+                    with self._stats_lock:
+                        self.stats["tasks_pushed"] += 1
 
-        timeout = self.profile_config.get("timeout", 3600)
-        return self._wait_for_phase("fuzzing", timeout=timeout)
+    def _run_sniper_phase(self):
+        """Push sniper tasks based on findings."""
+        sniper_config = self.profile_config.get("sniper", {})
+        if not sniper_config.get("enabled", False):
+            self._add_event("info", "Sniper disabled in profile – skipping")
+            return
 
-    def _run_sniper_phase(self) -> bool:
-        """Phase 3: Sniper (CVE-based scanning)."""
-        sniper_cfg = self.profile_config.get("sniper", {})
-        if not sniper_cfg.get("enabled", False):
-            logger.info("Sniper disabled in profile. Skipping.")
-            return True
+        feeds = sniper_config.get("feeds", ["github"])
+        findings = self._get_current_findings()
 
-        self.current_phase = "sniper"
-        logger.info("=== Phase 3: Sniper ===")
+        if not findings:
+            self._add_event("warning", "No findings for sniper phase – skipping")
+            return
 
-        feeds = sniper_cfg.get("feeds", ["github"])
+        for finding in findings:
+            task_id = f"{self.scan_id}_sniper_{uuid.uuid4().hex[:6]}"
 
-        for target in self.targets:
-            task_id = self._make_task_id("SNIPER", target)
+            with self._tasks_lock:
+                if task_id in self._completed_tasks:
+                    continue
 
-            if task_id in self._completed_task_ids:
-                logger.info("Skipping completed sniper task %s (Edge case #8)", task_id)
-                continue
-
-            task = {
+            task_payload = {
                 "task_id": task_id,
                 "scan_id": self.scan_id,
-                "type": "SNIPER",
-                "target": target,
-                "params": {
-                    "feeds": feeds,
-                    "profile": self.profile_name,
-                },
+                "phase": "sniper",
+                "finding": finding,
+                "feeds": feeds,
+                "auto_verify": sniper_config.get("auto_verify", True),
+                "status": STATUS_PENDING,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
 
-            self._push_task_safe("queue:sniper", task)
+            if self._push_task(self.QUEUE_SNIPER, task_payload):
+                self._add_activity(task_id, "sniper", f"verifying {finding.get('type', 'finding')}")
+                with self._stats_lock:
+                    self.stats["tasks_pushed"] += 1
 
-        timeout = self.profile_config.get("timeout", 3600)
-        return self._wait_for_phase("sniper", timeout=timeout)
+    # ── Task Management ───────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Main run method
-    # ------------------------------------------------------------------
-    def run(self) -> None:
-        """Execute the full scan lifecycle."""
-        enabled_phases = self.profile_config.get("phases", ["recon"])
-        logger.info(
-            "Starting scan %s: targets=%d, phases=%s",
-            self.scan_id,
-            len(self.targets),
-            enabled_phases,
+    def _push_task(self, queue: str, task: Dict[str, Any]) -> bool:
+        """Push a task to Redis queue with retry logic."""
+        if not self._redis:
+            self._add_error(f"Redis not connected – cannot push task {task.get('task_id')}")
+            return False
+
+        max_retries = self.redis_config.get("max_retries", 3)
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._redis.rpush(queue, json.dumps(task, default=str))
+                with self._tasks_lock:
+                    self._pending_tasks[task["task_id"]] = task
+                return True
+            except Exception as e:
+                if attempt == max_retries:
+                    self._add_error(
+                        f"Failed to push task after {max_retries} retries: {e}"
+                    )
+                    return False
+                time.sleep(self.redis_config.get("retry_delay", 2))
+
+        return False
+
+    def _start_result_listener(self):
+        """Start background thread to listen for task results from Redis."""
+        self._stop_event.clear()
+
+        def _listen():
+            while not self._stop_event.is_set():
+                try:
+                    if not self._redis:
+                        time.sleep(1)
+                        continue
+
+                    # BLPOP with timeout so we can check stop_event
+                    result = self._redis.blpop(self.QUEUE_RESULTS, timeout=2)
+                    if result is None:
+                        continue
+
+                    _, raw_data = result
+                    self._process_result(json.loads(raw_data))
+
+                except json.JSONDecodeError as e:
+                    self._add_error(f"Invalid result JSON: {e}")
+                except Exception as e:
+                    if not self._stop_event.is_set():
+                        self._add_error(f"Result listener error: {e}")
+                        time.sleep(2)
+
+        self._result_listener_thread = threading.Thread(
+            target=_listen, daemon=True, name="result-listener"
         )
+        self._result_listener_thread.start()
 
-        # Store scan metadata in Redis
-        self._store_scan_metadata()
+    def _process_result(self, result: Dict[str, Any]):
+        """Process a completed task result."""
+        task_id = result.get("task_id", "unknown")
+        status = result.get("status", "UNKNOWN").upper()
+        data = result.get("data", {})
+        tool = result.get("tool", result.get("phase", "unknown"))
 
-        phase_runners = {
-            "recon": self._run_recon_phase,
-            "fuzzing": self._run_fuzzing_phase,
-            "sniper": self._run_sniper_phase,
-        }
+        # Remove from activities
+        self.activities.remove_by_id(task_id)
 
-        for phase in enabled_phases:
-            if self._shutdown_requested.is_set():
-                logger.info("Shutdown requested. Stopping before phase '%s'.", phase)
-                break
+        with self._tasks_lock:
+            self._pending_tasks.pop(task_id, None)
+            self._completed_tasks[task_id] = result
 
-            if phase in self.phases_completed:
-                logger.info("Phase '%s' already completed (resume). Skipping.", phase)
-                continue
-
-            runner = phase_runners.get(phase)
-            if runner is None:
-                logger.warning("Unknown phase '%s'. Skipping.", phase)
-                continue
-
-            success = runner()
-            if success:
-                self.phases_completed.append(phase)
-                logger.info("Phase '%s' completed successfully.", phase)
-            elif self._shutdown_requested.is_set():
-                break
+        with self._stats_lock:
+            if status == STATUS_COMPLETED:
+                self.stats["tasks_completed"] += 1
             else:
-                logger.error("Phase '%s' failed. Stopping scan.", phase)
-                self._add_error(f"Phase {phase} failed")
-                break
+                self.stats["tasks_failed"] += 1
 
-        # Final result consumption (drain any remaining results)
-        results = self._consume_results()
-        for result in results:
-            self._process_result(result)
+            # Count AI/RAG usage
+            if data.get("ai_used"):
+                self.stats["ai_calls"] += 1
+            if data.get("rag_used"):
+                self.stats["rag_snippets"] += data.get("rag_snippets", 1)
 
-        if not self._shutdown_requested.is_set():
-            self.current_phase = None
-            logger.info(
-                "Scan %s completed. Findings: %d, Failed tasks: %d",
-                self.scan_id,
-                len(self.findings),
-                self._stats["tasks_failed"],
+        # Process findings
+        findings = data.get("findings", [])
+        if findings:
+            with self._stats_lock:
+                self.stats["findings_count"] += len(findings)
+
+            for finding in findings:
+                severity = finding.get("severity", "info").upper()
+                f_type = finding.get("type", "finding")
+                location = finding.get("url", finding.get("endpoint", "unknown"))
+
+                if severity in ("CRITICAL", "HIGH"):
+                    self._add_event(
+                        "critical",
+                        f"{severity} {f_type} at {location}",
+                    )
+                elif severity == "MEDIUM":
+                    self._add_event(
+                        "warning",
+                        f"{severity} {f_type} at {location}",
+                    )
+                else:
+                    self._add_event(
+                        "info",
+                        f"{f_type} at {location}",
+                    )
+
+        # Update tool summaries
+        self._update_summaries(tool, data)
+
+        # Log completion event
+        if status == STATUS_COMPLETED:
+            summary = data.get("summary", f"{tool} completed")
+            self._add_event("success", summary)
+        elif status == STATUS_FAILED:
+            error_msg = data.get("error", result.get("error", "Unknown error"))
+            self._add_error(f"{tool} failed: {error_msg}")
+
+    def _update_summaries(self, tool: str, data: Dict[str, Any]):
+        """Update aggregated tool summaries from result data."""
+        with self._summaries_lock:
+            # Ports
+            ports = data.get("ports", [])
+            if ports:
+                existing = set(self.tool_summaries["ports_open"])
+                existing.update(ports)
+                self.tool_summaries["ports_open"] = sorted(existing)
+
+            # Subdomains
+            subs = data.get("subdomains", [])
+            if subs:
+                self.tool_summaries["subdomains"] += len(subs)
+
+            # Endpoints
+            eps = data.get("endpoints", [])
+            if eps:
+                self.tool_summaries["endpoints"] += len(eps)
+                for ep in eps[:3]:  # Log first few
+                    url = ep if isinstance(ep, str) else ep.get("url", str(ep))
+                    status_code = ep.get("status", "") if isinstance(ep, dict) else ""
+                    self._add_event(
+                        "discovery",
+                        f"Endpoint: {url}" + (f" ({status_code})" if status_code else ""),
+                    )
+
+            # Technologies
+            techs = data.get("technologies", [])
+            if techs:
+                existing = set(self.tool_summaries["technologies"])
+                existing.update(techs)
+                self.tool_summaries["technologies"] = list(existing)
+                self._add_event("info", f"Tech: {', '.join(techs)}")
+
+            # Fuzzing stats
+            self.tool_summaries["payloads_sent"] += data.get("payloads_sent", 0)
+            self.tool_summaries["interesting_responses"] += data.get(
+                "interesting_responses", 0
             )
 
-    # ------------------------------------------------------------------
-    # State management
-    # ------------------------------------------------------------------
-    def get_state(self) -> dict:
-        """Export full scan state for persistence."""
-        with self._lock:
-            return {
+            # Nuclei/template stats
+            self.tool_summaries["templates_matched"] += data.get(
+                "templates_matched", 0
+            )
+            critical_count = sum(
+                1
+                for f in data.get("findings", [])
+                if f.get("severity", "").upper() in ("CRITICAL", "HIGH")
+            )
+            self.tool_summaries["critical_findings"] += critical_count
+
+    def _wait_for_phase_completion(self, phase: str, timeout: int = 600):
+        """Wait until all tasks for current phase are completed."""
+        deadline = time.time() + timeout
+        check_interval = 2
+
+        while time.time() < deadline:
+            if self._stop_event.is_set():
+                return
+
+            with self._tasks_lock:
+                pending_for_phase = [
+                    t for t in self._pending_tasks.values()
+                    if t.get("phase") == phase
+                ]
+
+            if not pending_for_phase:
+                self._add_event("success", f"Phase '{phase}' completed")
+                return
+
+            time.sleep(check_interval)
+
+        # Timeout
+        with self._tasks_lock:
+            remaining = len([
+                t for t in self._pending_tasks.values()
+                if t.get("phase") == phase
+            ])
+        if remaining > 0:
+            self._add_event(
+                "warning",
+                f"Phase '{phase}' timed out with {remaining} pending tasks",
+            )
+
+    def _get_discovered_endpoints(self) -> List[str]:
+        """Get endpoints discovered during recon for fuzzing."""
+        endpoints = []
+        with self._tasks_lock:
+            for result in self._completed_tasks.values():
+                data = result.get("data", {})
+                eps = data.get("endpoints", [])
+                for ep in eps:
+                    url = ep if isinstance(ep, str) else ep.get("url", str(ep))
+                    if url:
+                        endpoints.append(url)
+
+        # Fallback: use original targets if no endpoints found
+        if not endpoints:
+            endpoints = list(self.targets)
+
+        return endpoints
+
+    def _get_current_findings(self) -> List[Dict[str, Any]]:
+        """Get findings accumulated so far for sniper phase."""
+        findings = []
+        with self._tasks_lock:
+            for result in self._completed_tasks.values():
+                data = result.get("data", {})
+                findings.extend(data.get("findings", []))
+        return findings
+
+    def _generate_report(self):
+        """Trigger report generation."""
+        try:
+            report_data = {
                 "scan_id": self.scan_id,
                 "targets": self.targets,
                 "profile": self.profile_name,
-                "profile_config": self.profile_config,
-                "phases_completed": list(self.phases_completed),
-                "current_phase": self.current_phase,
-                "findings": list(self.findings),
-                "errors": list(self.errors),
-                "pending_tasks": list(self._pending_tasks),
-                "queued_tasks": list(self._queued_task_ids),
-                "processing_tasks": list(self._processing_task_ids),
-                "completed_tasks": list(self._completed_task_ids),
-                "failed_tasks": list(self._failed_task_ids),
-                "discovered_endpoints": list(self._discovered_endpoints),
-                "discovered_subdomains": list(self._discovered_subdomains),
-                "stats": dict(self._stats),
-                "started_at": self.started_at,
-                "paused_at": self.paused_at,
+                "stats": dict(self.stats),
+                "tool_summaries": dict(self.tool_summaries),
+                "findings": self._get_current_findings(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "data": {  # Required field
+                    "findings": self._get_current_findings(),
+                    "stats": dict(self.stats),
+                },
             }
 
-    def _restore_state(self, state: dict) -> None:
-        """Restore scan state from a previously saved state."""
-        self.phases_completed = state.get("phases_completed", [])
-        self.findings = state.get("findings", [])
-        self.errors = state.get("errors", [])
-        self.started_at = state.get("started_at", self.started_at)
-        self._pending_tasks = state.get("pending_tasks", [])
-        self._completed_task_ids = set(state.get("completed_tasks", []))
-        self._failed_task_ids = set(state.get("failed_tasks", []))
-        self._queued_task_ids = set(state.get("queued_tasks", []))
-        self._processing_task_ids = set(state.get("processing_tasks", []))
-        self._discovered_endpoints = state.get("discovered_endpoints", [])
-        self._discovered_subdomains = state.get("discovered_subdomains", [])
-        self._stats = state.get("stats", self._stats)
-        logger.info(
-            "State restored: %d phases completed, %d findings, %d pending tasks",
-            len(self.phases_completed),
-            len(self.findings),
-            len(self._pending_tasks),
-        )
+            # Try to push to reporting queue
+            if self._redis:
+                try:
+                    self._redis.rpush(
+                        "jarvis:queue:reporting",
+                        json.dumps(report_data, default=str),
+                    )
+                    self._add_event("success", "Report task queued")
+                except Exception as e:
+                    self._add_error(f"Failed to queue report: {e}")
+                    # Fallback: save JSON dump locally
+                    self._save_fallback_report(report_data)
+            else:
+                self._save_fallback_report(report_data)
 
-    def _store_scan_metadata(self) -> None:
-        """Store scan metadata in Redis for dashboard/other modules."""
-        client = self._get_redis()
-        if client is None:
-            return
+        except Exception as e:
+            self._add_error(f"Report generation failed: {e}")
+            self._save_fallback_report({"error": str(e), "scan_id": self.scan_id})
+
+    def _save_fallback_report(self, data: Dict[str, Any]):
+        """Save report as JSON file when queue/template fails."""
         try:
-            meta = {
-                "scan_id": self.scan_id,
-                "targets": json.dumps(self.targets),
-                "profile": self.profile_name,
-                "started_at": self.started_at,
-                "status": "RUNNING",
-            }
-            client.hset(f"scan:{self.scan_id}", mapping=meta)
-            # Set TTL of 24 hours on scan metadata
-            client.expire(f"scan:{self.scan_id}", 86400)
-        except Exception as exc:
-            logger.warning("Cannot store scan metadata: %s", exc)
+            report_dir = Path("reports")
+            report_dir.mkdir(parents=True, exist_ok=True)
+            filepath = report_dir / f"{self.scan_id}_report.json"
+            with open(filepath, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            self._add_event("info", f"Fallback report saved: {filepath}")
+        except OSError as e:
+            self._add_error(f"Fallback report save failed: {e}")
 
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
-    def request_shutdown(self) -> None:
-        """Request graceful shutdown."""
-        logger.info("Shutdown requested for scan %s.", self.scan_id)
-        self._shutdown_requested.set()
-        self.paused_at = datetime.now(timezone.utc).isoformat()
+    # ── Event/Activity Helpers ────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Dashboard data
-    # ------------------------------------------------------------------
-    def get_stats(self) -> dict:
-        with self._lock:
-            return dict(self._stats)
+    def _add_event(self, event_type: str, message: str):
+        """Add an event to the live feed."""
+        self.events.append({
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "type": event_type,
+            "message": message,
+        })
 
-    def get_phase_progress(self) -> Dict[str, dict]:
-        with self._lock:
-            return dict(self._phase_progress)
+    def _add_error(self, message: str):
+        """Add an error to the error panel."""
+        self.errors.append({
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "message": message,
+        })
+        self._log("error", f"[ScanController] {message}")
 
-    def get_recent_findings(self, n: int = 50) -> List[dict]:
-        with self._lock:
-            return list(self.findings[-n:])
+    def _add_activity(self, task_id: str, tool: str, description: str):
+        """Add a current activity."""
+        self.activities.append({
+            "task_id": task_id,
+            "tool": tool,
+            "description": description,
+            "started_at": time.time(),
+        })
 
-    def get_recent_errors(self, n: int = 20) -> List[dict]:
-        with self._lock:
-            return list(self.errors[-n:])
+    # ── Queue Status ──────────────────────────────────────────────────
 
     def get_queue_lengths(self) -> Dict[str, int]:
-        """Get current queue lengths from Redis."""
-        client = self._get_redis()
-        if client is None:
+        """Get current Redis queue lengths."""
+        if not self._redis:
+            return {}
+        try:
+            return {
+                "recon": self._redis.llen(self.QUEUE_RECON),
+                "fuzzer": self._redis.llen(self.QUEUE_FUZZER),
+                "sniper": self._redis.llen(self.QUEUE_SNIPER),
+                "results": self._redis.llen(self.QUEUE_RESULTS),
+            }
+        except Exception:
             return {}
 
-        queues = {
-            "queue:recon": 0,
-            "queue:smart_fuzzer": 0,
-            "queue:sniper": 0,
-            f"results:{self.scan_id}": 0,
+    # ── State Export ──────────────────────────────────────────────────
+
+    def get_full_state(self) -> Dict[str, Any]:
+        """Export full scan state for saving/resume."""
+        with self._tasks_lock:
+            completed = dict(self._completed_tasks)
+            pending = dict(self._pending_tasks)
+
+        return {
+            "scan_id": self.scan_id,
+            "targets": self.targets,
+            "profile_name": self.profile_name,
+            "current_phase": self.current_phase,
+            "status": self.status,
+            "stats": dict(self.stats),
+            "tool_summaries": dict(self.tool_summaries),
+            "completed_tasks": completed,
+            "pending_tasks": pending,
+            "events": self.events.get_all(),
+            "errors": self.errors.get_all(),
         }
 
-        try:
-            pipe = client.pipeline(transaction=False)
-            for q in queues:
-                pipe.llen(q)
-            results = pipe.execute()
-            for q, length in zip(queues, results):
-                queues[q] = length or 0
-        except Exception as exc:
-            logger.debug("Queue length poll failed: %s", exc)
+    def get_elapsed_time(self) -> str:
+        """Get elapsed time as formatted string."""
+        if not self.start_time:
+            return "00:00"
+        elapsed = int(time.time() - self.start_time)
+        minutes, seconds = divmod(elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
-        return queues
+    # ── Shutdown ──────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Error tracking
-    # ------------------------------------------------------------------
-    def _add_error(self, message: str) -> None:
-        self.errors.append({
-            "message": message,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        # Keep last 100 errors
-        if len(self.errors) > 100:
-            self.errors = self.errors[-100:]
+    def stop(self):
+        """Signal stop to all background threads."""
+        self._stop_event.set()
+        if self._result_listener_thread and self._result_listener_thread.is_alive():
+            self._result_listener_thread.join(timeout=5)
+        if self._redis:
+            try:
+                self._redis.close()
+            except Exception:
+                pass
