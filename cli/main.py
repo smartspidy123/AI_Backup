@@ -1,118 +1,112 @@
 #!/usr/bin/env python3
 """
-Centaur-Jarvis CLI Entry Point
-==============================
+Centaur-Jarvis CLI – Master Entry Point
+
 Usage:
     python -m cli.main --target https://example.com
-    python -m cli.main --target targets.txt --profile full
-    python -m cli.main --resume SCAN_123
+    python -m cli.main --target https://example.com --profile full
+    python -m cli.main --target targets.txt
+    python -m cli.main --resume SCAN_12345678
+    python -m cli.main --target https://example.com --manual
+    python -m cli.main --target https://example.com --verbose
     python -m cli.main --list-profiles
-    python -m cli.main --export findings.json --scan-id SCAN_123
+    python -m cli.main --list-scans
 
-This is the single command interface for all Centaur-Jarvis operations.
-It coordinates process management, scan orchestration, live display,
-and graceful shutdown with state persistence.
+Edge Cases Handled:
+- No arguments → help message
+- Invalid profile → fallback to default + warning
+- No target and no resume → error
+- Ctrl+C → graceful shutdown + state save
+- Duplicate instance → error + exit
+- Missing dependencies → clear error messages
 """
 
 import sys
 import os
 import signal
-import logging
-import uuid
-import json
+import threading
+import time
+import argparse
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, Dict, Any
 
-import click
+# Add project root to path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# ── Dependency Check ──────────────────────────────────────────────────
+
+def check_dependencies():
+    """Verify required packages are installed."""
+    missing = []
+    try:
+        import yaml
+    except ImportError:
+        missing.append("pyyaml")
+    try:
+        import redis
+    except ImportError:
+        missing.append("redis")
+    try:
+        import rich
+    except ImportError:
+        missing.append("rich")
+
+    if missing:
+        print(f"\n[ERROR] Missing required packages: {', '.join(missing)}")
+        print(f"Install with: pip install {' '.join(missing)}\n")
+        sys.exit(1)
+
+
+check_dependencies()
+
 import yaml
+from rich.console import Console
 
-# ---------------------------------------------------------------------------
-# Logging bootstrap – must happen before any module import that logs
-# ---------------------------------------------------------------------------
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-logging.basicConfig(
-    level=logging.INFO,
-    format=LOG_FORMAT,
-    handlers=[
-        logging.StreamHandler(sys.stderr),
-        logging.FileHandler(
-            os.path.expanduser("~/.centaur/cli.log"), mode="a", delay=True
-        ),
-    ],
-)
-logger = logging.getLogger("cli.main")
-
-# ---------------------------------------------------------------------------
-# Internal imports (deferred to allow logging setup first)
-# ---------------------------------------------------------------------------
 from cli.scan_controller import ScanController
-from cli.live_display import LiveDashboard
+from cli.live_display import LiveDisplay, BANNER_ART, HAS_RICH
 from cli.process_manager import ProcessManager
 from cli.state_manager import StateManager
 
 
-# ===========================================================================
-# Configuration Loader
-# ===========================================================================
-DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
+# ── Global State ──────────────────────────────────────────────────────
+
+console = Console()
+shutdown_event = threading.Event()
+scan_controller: Optional[ScanController] = None
+process_manager: Optional[ProcessManager] = None
+state_manager: Optional[StateManager] = None
 
 
-def load_config(config_path: Optional[str] = None) -> dict:
-    """
-    Load CLI configuration from YAML.
-    Falls back to hardcoded defaults if file missing or corrupt.
-    Edge case #14: Invalid/missing config → use defaults + warn.
-    """
-    path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+# ── Config Loading ────────────────────────────────────────────────────
 
-    # Hardcoded fallback config (edge case #5, #14)
-    fallback = {
-        "redis": {
-            "host": "127.0.0.1",
-            "port": 6379,
-            "db": 0,
-            "socket_timeout": 5,
-            "retry_on_timeout": True,
-            "health_check_interval": 30,
-        },
-        "state": {
-            "directory": "~/.centaur/scans",
-            "fallback_directory": "/tmp/centaur_scans",
-            "auto_save_interval": 30,
-        },
-        "reports": {
-            "output_directory": "reports/",
-            "formats": ["html", "json"],
-            "include_raw_data": True,
-        },
-        "processes": {
-            "heartbeat_timeout": 30,
-            "kill_timeout": 10,
-            "pid_directory": "~/.centaur/pids",
-            "services": {
-                "orchestrator": {
-                    "command": "python -m modules.orchestrator.main",
-                    "heartbeat_key": "heartbeat:orchestrator",
-                    "queue": "queue:orchestrator",
-                },
-                "recon_worker": {
-                    "command": "python -m modules.recon.worker",
-                    "heartbeat_key": "heartbeat:recon_worker",
-                    "queue": "queue:recon",
-                },
-                "smart_fuzzer": {
-                    "command": "python -m modules.smart_fuzzer.main",
-                    "heartbeat_key": "heartbeat:smart_fuzzer",
-                    "queue": "queue:smart_fuzzer",
-                },
-                "sniper": {
-                    "command": "python -m modules.sniper.main",
-                    "heartbeat_key": "heartbeat:sniper",
-                    "queue": "queue:sniper",
-                },
-            },
-        },
+def load_config() -> Dict[str, Any]:
+    """Load CLI configuration from config.yaml."""
+    config_path = Path(__file__).parent / "config.yaml"
+
+    if not config_path.exists():
+        console.print(f"[yellow]⚠ Config file not found: {config_path}. Using defaults.[/]")
+        return _default_config()
+
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        if not isinstance(config, dict):
+            console.print("[yellow]⚠ Invalid config.yaml. Using defaults.[/]")
+            return _default_config()
+        return config
+    except yaml.YAMLError as e:
+        console.print(f"[red]✘ YAML parse error in config.yaml: {e}[/]")
+        return _default_config()
+    except OSError as e:
+        console.print(f"[red]✘ Cannot read config.yaml: {e}[/]")
+        return _default_config()
+
+
+def _default_config() -> Dict[str, Any]:
+    """Default configuration when config.yaml is missing/invalid."""
+    return {
         "profiles": {
             "quick": {
                 "description": "Fast recon-only scan",
@@ -120,580 +114,496 @@ def load_config(config_path: Optional[str] = None) -> dict:
                 "recon_tasks": ["nuclei"],
                 "fuzzing": {"enabled": False},
                 "sniper": {"enabled": False},
-                "timeout": 600,
+                "timeout_minutes": 15,
             },
             "full": {
-                "description": "Complete scan",
+                "description": "Comprehensive scan",
                 "phases": ["recon", "fuzzing", "sniper"],
                 "recon_tasks": ["subfinder", "httpx", "nuclei"],
-                "fuzzing": {
-                    "enabled": True,
-                    "vuln_types": ["xss", "sqli", "ssti"],
-                    "max_iterations": 3,
-                },
-                "sniper": {
-                    "enabled": True,
-                    "feeds": ["github", "packetstorm"],
-                },
-                "timeout": 7200,
+                "fuzzing": {"enabled": True, "vuln_types": ["xss", "sqli"], "max_iterations": 3},
+                "sniper": {"enabled": True, "feeds": ["github"]},
+                "timeout_minutes": 120,
             },
-        },
-        "notifications": {
-            "discord_webhook": "",
-            "slack_webhook": "",
-            "notify_severities": ["CRITICAL", "HIGH"],
-            "rate_limit_seconds": 10,
         },
         "display": {
             "refresh_interval": 2,
-            "max_visible_findings": 50,
-            "show_queues": True,
-            "show_errors": True,
-            "max_visible_errors": 20,
+            "max_events": 50,
+            "max_activities": 8,
+            "max_errors": 20,
+            "show_tool_summaries": True,
+            "show_queue_status": True,
+            "error_panel": True,
+            "verbose": False,
+            "hacker_theme": True,
+            "show_banner": True,
+        },
+        "redis": {
+            "host": "127.0.0.1",
+            "port": 6379,
+            "db": 0,
+            "password": None,
+            "socket_timeout": 5,
+            "max_retries": 3,
+            "retry_delay": 2,
+        },
+        "processes": {},
+        "state": {
+            "save_directory": ".jarvis_state",
+            "auto_save_interval": 30,
+            "max_state_files": 20,
+            "fallback_directory": "/tmp/jarvis_state",
         },
     }
 
-    if not path.exists():
-        logger.warning(
-            "Config file %s not found. Using hardcoded defaults. (Edge case #14)",
-            path,
-        )
-        return fallback
 
-    try:
-        with open(path, "r") as fh:
-            loaded = yaml.safe_load(fh) or {}
-        # Deep-merge loaded over fallback so missing keys get defaults
-        merged = _deep_merge(fallback, loaded)
-        logger.info("Configuration loaded from %s", path)
-        return merged
-    except yaml.YAMLError as exc:
-        logger.error(
-            "Invalid YAML in %s: %s. Using defaults. (Edge case #14)", path, exc
-        )
-        return fallback
-    except OSError as exc:
-        logger.error(
-            "Cannot read %s: %s. Using defaults. (Edge case #14)", path, exc
-        )
-        return fallback
+# ── Signal Handlers ───────────────────────────────────────────────────
 
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    global scan_controller, process_manager, state_manager
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into *base*, returning new dict."""
-    merged = base.copy()
-    for key, value in override.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    console.print("\n[yellow]⚠ Interrupt received. Shutting down gracefully...[/]")
+    shutdown_event.set()
 
-
-# ===========================================================================
-# Target Resolution
-# ===========================================================================
-def resolve_targets(target_value: str) -> List[str]:
-    """
-    Resolve --target to a list of URLs.
-    Supports:
-      - Single URL (starts with http:// or https://)
-      - File path (one URL per line)
-      - Comma-separated URLs
-
-    Edge case #13: target file not found → clear error + exit.
-    """
-    # Check if it looks like a file path
-    target_path = Path(target_value)
-    if target_path.exists() and target_path.is_file():
+    # Save state if scan is running
+    if scan_controller and state_manager:
+        scan_controller.status = "PAUSED"
         try:
-            lines = target_path.read_text().strip().splitlines()
-            targets = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
-            if not targets:
-                logger.error("Target file %s is empty.", target_path)
-                sys.exit(1)
-            logger.info("Loaded %d target(s) from %s", len(targets), target_path)
-            return targets
-        except OSError as exc:
-            logger.error("Cannot read target file %s: %s (Edge case #13)", target_path, exc)
-            sys.exit(1)
+            state = scan_controller.get_full_state()
+            saved = state_manager.save_state(scan_controller.scan_id, state)
+            if saved:
+                console.print(
+                    f"\n[green]✔ Scan state saved.[/] "
+                    f"Resume with: [bold cyan]python -m cli.main --resume {scan_controller.scan_id}[/]"
+                )
+            else:
+                console.print("[red]✘ Failed to save scan state.[/]")
+        except Exception as e:
+            console.print(f"[red]✘ Error saving state: {e}[/]")
 
-    # Check for comma-separated
-    if "," in target_value:
-        targets = [t.strip() for t in target_value.split(",") if t.strip()]
-        return targets
+    # Stop background processes
+    if process_manager:
+        try:
+            process_manager.stop_all(timeout=10)
+        except Exception as e:
+            console.print(f"[red]✘ Error stopping processes: {e}[/]")
 
-    # Single target
-    return [target_value]
+    # Stop scan controller
+    if scan_controller:
+        try:
+            scan_controller.stop()
+        except Exception:
+            pass
 
-
-# ===========================================================================
-# PID-based Concurrency Guard
-# ===========================================================================
-def check_concurrent_scan(targets: List[str], config: dict) -> None:
-    """
-    Edge case #10: Prevent multiple CLI instances scanning the same target.
-    Uses a lockfile in the PID directory.
-    """
-    pid_dir = Path(os.path.expanduser(config.get("processes", {}).get("pid_directory", "~/.centaur/pids")))
-    pid_dir.mkdir(parents=True, exist_ok=True)
-
-    for target in targets:
-        # Create a safe filename from target
-        safe_name = target.replace("://", "_").replace("/", "_").replace(":", "_")
-        lock_file = pid_dir / f"scan_{safe_name}.lock"
-        if lock_file.exists():
-            try:
-                lock_data = json.loads(lock_file.read_text())
-                old_pid = lock_data.get("pid")
-                # Check if that PID is still alive
-                if old_pid:
-                    try:
-                        import psutil
-                        if psutil.pid_exists(old_pid):
-                            proc = psutil.Process(old_pid)
-                            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                                logger.error(
-                                    "Another scan is already running for target %s (PID %d). "
-                                    "Edge case #10: Use --resume or wait for it to finish.",
-                                    target,
-                                    old_pid,
-                                )
-                                sys.exit(1)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass  # stale lock, remove it
-            except (json.JSONDecodeError, OSError):
-                pass  # corrupt lock, remove it
-            # Remove stale lock
-            lock_file.unlink(missing_ok=True)
-
-        # Write our lock
-        lock_file.write_text(json.dumps({"pid": os.getpid(), "target": target, "started": datetime.now(timezone.utc).isoformat()}))
+    # Stop auto-save
+    if state_manager:
+        try:
+            state_manager.stop_auto_save()
+        except Exception:
+            pass
 
 
-def release_scan_locks(targets: List[str], config: dict) -> None:
-    """Release lockfiles for targets."""
-    pid_dir = Path(os.path.expanduser(config.get("processes", {}).get("pid_directory", "~/.centaur/pids")))
-    for target in targets:
-        safe_name = target.replace("://", "_").replace("/", "_").replace(":", "_")
-        lock_file = pid_dir / f"scan_{safe_name}.lock"
-        lock_file.unlink(missing_ok=True)
+# ── CLI Argument Parsing ──────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="centaur-jarvis",
+        description="Centaur-Jarvis: AI-Powered VAPT Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python -m cli.main --target https://example.com
+  python -m cli.main --target https://example.com --profile full
+  python -m cli.main --target targets.txt
+  python -m cli.main --resume SCAN_12345678
+  python -m cli.main --target https://example.com --manual --verbose
+  python -m cli.main --list-profiles
+  python -m cli.main --list-scans
+        """,
+    )
+
+    # Target specification
+    target_group = parser.add_argument_group("Target")
+    target_group.add_argument(
+        "--target", "-t",
+        type=str,
+        help="Target URL, comma-separated URLs, or file containing URLs",
+    )
+    target_group.add_argument(
+        "--resume", "-r",
+        type=str,
+        metavar="SCAN_ID",
+        help="Resume a previously paused scan by ID",
+    )
+
+    # Scan configuration
+    scan_group = parser.add_argument_group("Scan Configuration")
+    scan_group.add_argument(
+        "--profile", "-p",
+        type=str,
+        default="quick",
+        help="Scan profile: quick, full, recon_only, custom (default: quick)",
+    )
+    scan_group.add_argument(
+        "--scan-id",
+        type=str,
+        default=None,
+        help="Custom scan ID (auto-generated if not specified)",
+    )
+
+    # Mode flags
+    mode_group = parser.add_argument_group("Modes")
+    mode_group.add_argument(
+        "--manual", "-m",
+        action="store_true",
+        help="Manual mode: assume services are already running",
+    )
+    mode_group.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose mode: show more detailed events",
+    )
+    mode_group.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Disable live dashboard (run headless)",
+    )
+
+    # Information
+    info_group = parser.add_argument_group("Information")
+    info_group.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="List available scan profiles and exit",
+    )
+    info_group.add_argument(
+        "--list-scans",
+        action="store_true",
+        help="List saved scan states and exit",
+    )
+
+    return parser
 
 
-# ===========================================================================
-# Click CLI Definition
-# ===========================================================================
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
-@click.option(
-    "--target", "-t",
-    type=str,
-    default=None,
-    help="Target URL, comma-separated URLs, or path to a file with one URL per line.",
-)
-@click.option(
-    "--profile", "-p",
-    type=str,
-    default="full",
-    help="Scan profile name (quick, full, recon_only, custom). Default: full.",
-)
-@click.option(
-    "--resume", "-r",
-    type=str,
-    default=None,
-    help="Resume a previously paused scan by its SCAN_ID.",
-)
-@click.option(
-    "--manual", "-m",
-    is_flag=True,
-    default=False,
-    help="Manual mode: assume all backend services are already running.",
-)
-@click.option(
-    "--list-profiles",
-    is_flag=True,
-    default=False,
-    help="List available scan profiles and exit.",
-)
-@click.option(
-    "--export",
-    type=str,
-    default=None,
-    help="Export findings to the specified file (JSON).",
-)
-@click.option(
-    "--scan-id",
-    type=str,
-    default=None,
-    help="Scan ID to use with --export.",
-)
-@click.option(
-    "--config",
-    type=str,
-    default=None,
-    help="Path to an alternative config.yaml.",
-)
-@click.option(
-    "--verbose", "-v",
-    is_flag=True,
-    default=False,
-    help="Enable debug logging.",
-)
-@click.option(
-    "--no-display",
-    is_flag=True,
-    default=False,
-    help="Disable live dashboard (useful for CI/piping).",
-)
-def cli(
-    target: Optional[str],
-    profile: str,
-    resume: Optional[str],
-    manual: bool,
-    list_profiles: bool,
-    export: Optional[str],
-    scan_id: Optional[str],
-    config: Optional[str],
-    verbose: bool,
-    no_display: bool,
-) -> None:
-    """
-    Centaur-Jarvis – AI-Powered VAPT Agent CLI
+# ── Command Handlers ──────────────────────────────────────────────────
 
-    Start a vulnerability scan, view live results, pause/resume, and generate reports.
-    """
-    # -----------------------------------------------------------------------
-    # Verbosity
-    # -----------------------------------------------------------------------
-    if verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled.")
+def handle_list_profiles(config: Dict[str, Any]):
+    """Display available scan profiles."""
+    profiles = config.get("profiles", {})
 
-    # -----------------------------------------------------------------------
-    # Load configuration
-    # -----------------------------------------------------------------------
-    cfg = load_config(config)
+    if HAS_RICH:
+        from rich.table import Table
+        from rich import box
 
-    # -----------------------------------------------------------------------
-    # --list-profiles
-    # -----------------------------------------------------------------------
-    if list_profiles:
-        _print_profiles(cfg)
-        sys.exit(0)
+        table = Table(
+            title="📋 Available Scan Profiles",
+            box=box.ROUNDED,
+            border_style="cyan",
+        )
+        table.add_column("Profile", style="bold cyan")
+        table.add_column("Description")
+        table.add_column("Phases", style="green")
+        table.add_column("Recon Tools", style="yellow")
+        table.add_column("Fuzzing", style="magenta")
+        table.add_column("Sniper", style="red")
 
-    # -----------------------------------------------------------------------
-    # --export
-    # -----------------------------------------------------------------------
-    if export:
-        if not scan_id:
-            click.echo("ERROR: --export requires --scan-id.", err=True)
-            sys.exit(1)
-        _export_findings(export, scan_id, cfg)
-        sys.exit(0)
+        for name, cfg in profiles.items():
+            phases = ", ".join(cfg.get("phases", []))
+            tools = ", ".join(cfg.get("recon_tasks", []))
+            fuzzing = "✔" if cfg.get("fuzzing", {}).get("enabled") else "✘"
+            sniper = "✔" if cfg.get("sniper", {}).get("enabled") else "✘"
+            desc = cfg.get("description", "No description")
+            table.add_row(name, desc, phases, tools, fuzzing, sniper)
 
-    # -----------------------------------------------------------------------
-    # --resume
-    # -----------------------------------------------------------------------
-    if resume:
-        _run_resume(resume, cfg, manual, no_display)
+        console.print(table)
+    else:
+        print("\nAvailable Profiles:")
+        for name, cfg in profiles.items():
+            print(f"  {name}: {cfg.get('description', 'N/A')}")
+            print(f"    Phases: {cfg.get('phases', [])}")
+
+
+def handle_list_scans(config: Dict[str, Any]):
+    """Display saved scan states."""
+    state_cfg = config.get("state", {})
+    sm = StateManager(
+        save_directory=state_cfg.get("save_directory", ".jarvis_state"),
+        fallback_directory=state_cfg.get("fallback_directory", "/tmp/jarvis_state"),
+    )
+    scans = sm.list_saved_scans()
+
+    if not scans:
+        console.print("[yellow]No saved scans found.[/]")
         return
 
-    # -----------------------------------------------------------------------
-    # --target (required for new scan)
-    # -----------------------------------------------------------------------
-    if not target:
-        click.echo("ERROR: --target is required for a new scan. Use -h for help.", err=True)
-        sys.exit(1)
+    if HAS_RICH:
+        from rich.table import Table
+        from rich import box
 
-    targets = resolve_targets(target)
-    if not targets:
-        click.echo("ERROR: No valid targets resolved.", err=True)
-        sys.exit(1)
-
-    # Validate profile
-    profiles = cfg.get("profiles", {})
-    if profile not in profiles:
-        logger.warning(
-            "Profile '%s' not found. Falling back to 'full'. (Edge case #14)",
-            profile,
+        table = Table(
+            title="💾 Saved Scans",
+            box=box.ROUNDED,
+            border_style="cyan",
         )
-        profile = "full" if "full" in profiles else list(profiles.keys())[0]
+        table.add_column("Scan ID", style="bold cyan")
+        table.add_column("Saved At")
+        table.add_column("Size", style="dim")
 
-    # Concurrency guard (edge case #10)
-    check_concurrent_scan(targets, cfg)
+        for scan in scans:
+            table.add_row(
+                scan["scan_id"],
+                scan["saved_at"],
+                f"{scan['size_kb']} KB",
+            )
 
-    # Generate scan ID
-    generated_scan_id = f"SCAN_{uuid.uuid4().hex[:12].upper()}"
-    logger.info("Starting scan %s with profile '%s' for %d target(s).", generated_scan_id, profile, len(targets))
+        console.print(table)
+        console.print("\n[dim]Resume with: python -m cli.main --resume <SCAN_ID>[/]")
+    else:
+        print("\nSaved Scans:")
+        for scan in scans:
+            print(f"  {scan['scan_id']} (saved: {scan['saved_at']}, {scan['size_kb']} KB)")
+
+
+# ── Main Scan Flow ────────────────────────────────────────────────────
+
+def run_scan(args, config: Dict[str, Any]):
+    """Main scan execution flow."""
+    global scan_controller, process_manager, state_manager
+
+    # Register signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # ── Resolve profile ──
+    profile_name = args.profile
+    profiles = config.get("profiles", {})
+
+    if profile_name not in profiles:
+        console.print(
+            f"[yellow]⚠ Profile '{profile_name}' not found. "
+            f"Available: {list(profiles.keys())}. Falling back to 'quick'.[/]"
+        )
+        profile_name = "quick"
+        if profile_name not in profiles:
+            profile_name = list(profiles.keys())[0] if profiles else "quick"
+
+    profile_config = profiles.get(profile_name, _default_config()["profiles"]["quick"])
+    display_config = config.get("display", _default_config()["display"])
+    redis_config = config.get("redis", _default_config()["redis"])
+    state_config = config.get("state", _default_config()["state"])
+
+    if args.verbose:
+        display_config["verbose"] = True
+
+    # ── Initialize State Manager ──
+    state_manager = StateManager(
+        save_directory=state_config.get("save_directory", ".jarvis_state"),
+        fallback_directory=state_config.get("fallback_directory", "/tmp/jarvis_state"),
+        auto_save_interval=state_config.get("auto_save_interval", 30),
+        max_state_files=state_config.get("max_state_files", 20),
+    )
+
+    # ── Initialize Process Manager ──
+    process_manager = ProcessManager(
+        config=config,
+        manual_mode=args.manual,
+    )
+
+    # Check for duplicate instances
+    if not args.manual and process_manager.check_duplicate_instance():
+        console.print(
+            "[red]✘ Another Centaur-Jarvis instance is already running.[/]\n"
+            "[dim]Kill it first or use --manual mode.[/]"
+        )
+        sys.exit(1)
+
+    # ── Initialize Scan Controller ──
+    scan_controller = ScanController(
+        redis_config=redis_config,
+        profile_config=profile_config,
+        display_config=display_config,
+    )
+
+    # ── Resume or New Scan ──
+    if args.resume:
+        console.print(f"[cyan]Resuming scan: {args.resume}[/]")
+        saved_state = state_manager.load_state(args.resume)
+        if not saved_state:
+            console.print(f"[red]✘ No saved state found for scan '{args.resume}'[/]")
+            console.print("[dim]Use --list-scans to see available scans.[/]")
+            sys.exit(1)
+
+        if not scan_controller.restore_from_state(saved_state):
+            console.print("[red]✘ Failed to restore scan state. Check Redis connection.[/]")
+            sys.exit(1)
+
+        profile_name = scan_controller.profile_name
+        profile_config = profiles.get(profile_name, profile_config)
+
+    else:
+        # New scan
+        if not args.target:
+            console.print("[red]✘ No target specified. Use --target or --resume.[/]")
+            console.print("[dim]Run with --help for usage information.[/]")
+            sys.exit(1)
+
+        if not scan_controller.initialize_scan(
+            target_input=args.target,
+            profile_name=profile_name,
+            scan_id=args.scan_id,
+        ):
+            console.print("[red]✘ Scan initialization failed. Check errors above.[/]")
+            # Show accumulated errors
+            for err in scan_controller.errors.get_all():
+                console.print(f"  [red]✘ {err.get('message')}[/]")
+            sys.exit(1)
+
+    # ── Start Background Services (non-manual mode) ──
+    if not args.manual:
+        phases = profile_config.get("phases", ["recon"])
+        console.print("[cyan]Starting background services...[/]")
+        service_results = process_manager.start_services(required_phases=phases)
+
+        # Check if required services failed
+        for svc_name, svc_status in service_results.items():
+            if svc_status == "FAILED":
+                proc_cfg = config.get("processes", {}).get(svc_name, {})
+                if proc_cfg.get("required", False):
+                    console.print(
+                        f"[red]✘ Required service '{svc_name}' failed to start.[/]\n"
+                        f"[dim]Try --manual mode if services are running externally.[/]"
+                    )
+                    process_manager.stop_all()
+                    sys.exit(1)
+                else:
+                    console.print(f"[yellow]⚠ Optional service '{svc_name}' failed to start.[/]")
+    else:
+        console.print("[yellow]Manual mode: assuming services are already running.[/]")
+
+    # ── Start Auto-Save ──
+    state_manager.start_auto_save(
+        scan_id=scan_controller.scan_id,
+        state_getter=scan_controller.get_full_state,
+    )
+
+    # ── Initialize Display ──
+    display = LiveDisplay(
+        scan_controller=scan_controller,
+        display_config=display_config,
+        verbose=args.verbose,
+    )
+
+    # ── Run Scan in Background Thread ──
+    scan_thread = threading.Thread(
+        target=_run_scan_thread,
+        args=(scan_controller,),
+        daemon=True,
+        name="scan-main",
+    )
+    scan_thread.start()
+
+    # ── Start Live Display (blocks until shutdown) ──
+    if not args.no_display:
+        try:
+            display.start(stop_event=shutdown_event)
+        except KeyboardInterrupt:
+            shutdown_event.set()
+    else:
+        # Headless mode: just wait for scan to complete
+        console.print("[dim]Running headless (no display). Press Ctrl+C to stop.[/]")
+        try:
+            while not shutdown_event.is_set():
+                if scan_controller.status in ("COMPLETED", "FAILED"):
+                    shutdown_event.set()
+                    break
+                shutdown_event.wait(timeout=2)
+        except KeyboardInterrupt:
+            shutdown_event.set()
+
+    # ── Wait for scan thread to finish ──
+    scan_thread.join(timeout=10)
+
+    # ── Final Summary ──
+    display.print_summary()
+
+    # ── Cleanup ──
+    state_manager.stop_auto_save()
+
+    if scan_controller.status == "COMPLETED":
+        # Clean up saved state on completion
+        state_manager.delete_state(scan_controller.scan_id)
+    elif scan_controller.status == "PAUSED":
+        # State already saved by signal handler
+        console.print(
+            f"\n[yellow]Scan paused.[/] "
+            f"Resume: [bold cyan]python -m cli.main --resume {scan_controller.scan_id}[/]"
+        )
+
+    if not args.manual:
+        process_manager.stop_all()
+
+    # Clean PID file
+    if not args.manual:
+        pid_file = ProcessManager.PID_DIR / "cli_master.pid"
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Exit code based on status
+    exit_code = 0 if scan_controller.status == "COMPLETED" else 1
+    sys.exit(exit_code)
+
+
+def _run_scan_thread(controller: ScanController):
+    """Run the scan in a background thread."""
+    global shutdown_event
+    try:
+        controller.run_scan()
+    except Exception as e:
+        controller._add_error(f"Scan thread crashed: {e}")
+        controller.status = "FAILED"
+    finally:
+        if controller.status not in ("PAUSED",):
+            # Give display time to show final state
+            time.sleep(3)
+            shutdown_event.set()
+
+
+# ── Entry Point ───────────────────────────────────────────────────────
+
+def main():
+    """Main entry point for the CLI."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Show banner
+    if HAS_RICH:
+        console.print(f"[bold red]{BANNER_ART}[/]")
+    else:
+        print(BANNER_ART)
+
+    # Load config
+    config = load_config()
+
+    # Handle info commands
+    if args.list_profiles:
+        handle_list_profiles(config)
+        sys.exit(0)
+
+    if args.list_scans:
+        handle_list_scans(config)
+        sys.exit(0)
+
+    # Validate: need either target or resume
+    if not args.target and not args.resume:
+        parser.print_help()
+        console.print("\n[red]✘ Specify --target or --resume to start.[/]")
+        sys.exit(1)
 
     # Run the scan
-    _run_scan(
-        scan_id=generated_scan_id,
-        targets=targets,
-        profile_name=profile,
-        config=cfg,
-        manual=manual,
-        no_display=no_display,
-    )
-
-    # Release locks
-    release_scan_locks(targets, cfg)
-
-
-# ===========================================================================
-# Core Run Functions
-# ===========================================================================
-def _run_scan(
-    scan_id: str,
-    targets: List[str],
-    profile_name: str,
-    config: dict,
-    manual: bool,
-    no_display: bool,
-) -> None:
-    """Execute a full scan lifecycle."""
-    profile_cfg = config["profiles"][profile_name]
-    state_mgr = StateManager(config)
-    proc_mgr = ProcessManager(config)
-    dashboard: Optional[LiveDashboard] = None
-
-    # ------------------------------------------------------------------
-    # 1. Ensure backend services (edge cases #1, #18)
-    # ------------------------------------------------------------------
-    if not manual:
-        required_services = _services_for_profile(profile_cfg)
-        click.echo(f"[*] Auto mode: ensuring {len(required_services)} service(s)...")
-        for svc in required_services:
-            ok = proc_mgr.ensure_service(svc)
-            if not ok:
-                logger.error(
-                    "Cannot start service '%s'. Try --manual if services run externally. "
-                    "(Edge case #18)",
-                    svc,
-                )
-                click.echo(
-                    f"ERROR: Failed to start '{svc}'. "
-                    f"Start it manually and re-run with --manual.",
-                    err=True,
-                )
-                release_scan_locks(targets, config)
-                sys.exit(1)
-        click.echo("[+] All services running.")
-    else:
-        click.echo("[*] Manual mode: assuming all services are running.")
-
-    # ------------------------------------------------------------------
-    # 2. Initialize scan controller
-    # ------------------------------------------------------------------
-    controller = ScanController(
-        scan_id=scan_id,
-        targets=targets,
-        profile_name=profile_name,
-        profile_config=profile_cfg,
-        config=config,
-        state_manager=state_mgr,
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Initialize live display
-    # ------------------------------------------------------------------
-    if not no_display:
-        dashboard = LiveDashboard(
-            scan_id=scan_id,
-            targets=targets,
-            profile_name=profile_name,
-            config=config,
-            controller=controller,
-        )
-
-    # ------------------------------------------------------------------
-    # 4. Register signal handlers for graceful shutdown (edge case #7)
-    # ------------------------------------------------------------------
-    def _shutdown_handler(signum: int, frame) -> None:
-        sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
-        logger.info("Received %s – initiating graceful shutdown.", sig_name)
-        controller.request_shutdown()
-
-    signal.signal(signal.SIGINT, _shutdown_handler)
-    signal.signal(signal.SIGTERM, _shutdown_handler)
-
-    # ------------------------------------------------------------------
-    # 5. Run scan with live display
-    # ------------------------------------------------------------------
-    try:
-        if dashboard:
-            dashboard.run_with_scan(controller)
-        else:
-            # No display – just run controller synchronously
-            controller.run()
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt caught at top level.")
-        controller.request_shutdown()
-    finally:
-        # ------------------------------------------------------------------
-        # 6. Post-scan actions
-        # ------------------------------------------------------------------
-        if controller.is_paused:
-            saved_path = state_mgr.save_state(controller.get_state())
-            click.echo(f"\n[!] Scan paused. State saved to {saved_path}")
-            click.echo(f"    Resume with: python -m cli.main --resume {scan_id}")
-        else:
-            click.echo(f"\n[+] Scan {scan_id} completed.")
-            # Generate report (edge case #12)
-            _generate_report_safe(scan_id, config, controller)
-
-        if dashboard:
-            dashboard.stop()
-
-        # Cleanup processes if we started them
-        if not manual:
-            proc_mgr.stop_all()
-
-        release_scan_locks(targets, config)
-
-
-def _run_resume(
-    scan_id: str,
-    config: dict,
-    manual: bool,
-    no_display: bool,
-) -> None:
-    """Resume a previously paused scan."""
-    state_mgr = StateManager(config)
-    state = state_mgr.load_state(scan_id)
-    if state is None:
-        click.echo(f"ERROR: No saved state found for scan {scan_id}.", err=True)
-        sys.exit(1)
-
-    targets = state.get("targets", [])
-    profile_name = state.get("profile", "full")
-    profiles = config.get("profiles", {})
-    profile_cfg = profiles.get(profile_name, profiles.get("full", {}))
-
-    click.echo(f"[*] Resuming scan {scan_id} (profile: {profile_name}, targets: {len(targets)})")
-
-    # Concurrency guard
-    check_concurrent_scan(targets, config)
-
-    _run_scan(
-        scan_id=scan_id,
-        targets=targets,
-        profile_name=profile_name,
-        config=config,
-        manual=manual,
-        no_display=no_display,
-    )
-
-
-# ===========================================================================
-# Helper Functions
-# ===========================================================================
-def _services_for_profile(profile_cfg: dict) -> List[str]:
-    """Determine which backend services are needed for the given profile."""
-    services = ["orchestrator", "recon_worker"]  # always needed
-    phases = profile_cfg.get("phases", [])
-    if "fuzzing" in phases and profile_cfg.get("fuzzing", {}).get("enabled", False):
-        services.append("smart_fuzzer")
-    if "sniper" in phases and profile_cfg.get("sniper", {}).get("enabled", False):
-        services.append("sniper")
-    return services
-
-
-def _print_profiles(config: dict) -> None:
-    """Pretty-print available profiles."""
-    from rich.console import Console
-    from rich.table import Table
-
-    console = Console()
-    table = Table(title="Available Scan Profiles", show_lines=True)
-    table.add_column("Name", style="bold cyan")
-    table.add_column("Description")
-    table.add_column("Phases")
-    table.add_column("Timeout")
-
-    for name, pcfg in config.get("profiles", {}).items():
-        desc = pcfg.get("description", "N/A")
-        phases = ", ".join(pcfg.get("phases", []))
-        timeout = str(pcfg.get("timeout", "N/A")) + "s"
-        table.add_row(name, desc, phases, timeout)
-
-    console.print(table)
-
-
-def _export_findings(filepath: str, scan_id: str, config: dict) -> None:
-    """Export findings from a saved state to JSON."""
-    state_mgr = StateManager(config)
-    state = state_mgr.load_state(scan_id)
-    if state is None:
-        click.echo(f"ERROR: No saved state found for scan {scan_id}.", err=True)
-        sys.exit(1)
-
-    findings = state.get("findings", [])
-    try:
-        out_path = Path(filepath)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(findings, indent=2, default=str))
-        click.echo(f"[+] Exported {len(findings)} finding(s) to {out_path}")
-    except OSError as exc:
-        click.echo(f"ERROR: Cannot write to {filepath}: {exc}", err=True)
-        sys.exit(1)
-
-
-def _generate_report_safe(scan_id: str, config: dict, controller) -> None:
-    """
-    Generate report with fallback on failure. (Edge case #12)
-    """
-    try:
-        from modules.reporting.generator import generate_report
-
-        output_dir = config.get("reports", {}).get("output_directory", "reports/")
-        generate_report(scan_id=scan_id, output_dir=output_dir)
-        click.echo(f"[+] Report generated in {output_dir}")
-    except ImportError:
-        logger.warning(
-            "Reporting module not available. Falling back to JSON dump. (Edge case #12)"
-        )
-        _fallback_report(scan_id, config, controller)
-    except Exception as exc:
-        logger.error(
-            "Report generation failed: %s. Using fallback. (Edge case #12)", exc
-        )
-        _fallback_report(scan_id, config, controller)
-
-
-def _fallback_report(scan_id: str, config: dict, controller) -> None:
-    """Hardcoded fallback report when the reporting module is unavailable."""
-    output_dir = Path(config.get("reports", {}).get("output_directory", "reports/"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    state = controller.get_state()
-    report = {
-        "scan_id": scan_id,
-        "targets": state.get("targets", []),
-        "profile": state.get("profile", "unknown"),
-        "phases_completed": state.get("phases_completed", []),
-        "findings_count": len(state.get("findings", [])),
-        "findings": state.get("findings", []),
-        "stats": controller.get_stats(),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    filename = output_dir / f"{scan_id}_report.json"
-    try:
-        filename.write_text(json.dumps(report, indent=2, default=str))
-        click.echo(f"[+] Fallback report saved to {filename}")
-    except OSError as exc:
-        logger.error("Cannot write fallback report: %s (Edge case #11)", exc)
-
-
-# ===========================================================================
-# Entry Point
-# ===========================================================================
-def main() -> None:
-    """Wrapper for setuptools console_scripts entry point."""
-    # Ensure ~/.centaur directories exist
-    for d in ["~/.centaur", "~/.centaur/scans", "~/.centaur/pids"]:
-        Path(os.path.expanduser(d)).mkdir(parents=True, exist_ok=True)
-    cli()
+    run_scan(args, config)
 
 
 if __name__ == "__main__":
