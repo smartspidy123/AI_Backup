@@ -105,3 +105,97 @@ JSON
     }
   }
 }
+
+
+ASCII FLOW DIAGRAM
+==================
+
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │                        OAST LISTENER MODULE                            │
+ │                                                                         │
+ │  ┌──────────────────────────┐     ┌──────────────────────────────────┐  │
+ │  │    HTTP SERVER (FastAPI) │     │    DNS SERVER (dnslib/asyncio)   │  │
+ │  │    :8080 (configurable)  │     │    :53 (configurable)            │  │
+ │  │                          │     │                                  │  │
+ │  │  GET/POST/*  ──────────┐│     │  DNS Query ──────────────────┐   │  │
+ │  │  Extract:              ││     │  Extract:                    │   │  │
+ │  │   - URL, path, query   ││     │   - queried domain           │   │  │
+ │  │   - method, headers    ││     │   - record type (A/AAAA/TXT) │   │  │
+ │  │   - body (truncated)   ││     │   - source IP                │   │  │
+ │  │   - source IP          ││     │                              │   │  │
+ │  └────────────────────────┘│     └──────────────────────────────┘   │  │
+ │                  │         │                     │                   │  │
+ │                  ▼         │                     ▼                   │  │
+ │         ┌────────────────────────────────────────────────┐          │  │
+ │         │          Callback Object (models.py)           │          │  │
+ │         │  {id, type, source_ip, timestamp, url/domain,  │          │  │
+ │         │   method, headers, body, unique_id_extracted}   │          │  │
+ │         └────────────────────┬───────────────────────────┘          │  │
+ │                              │                                       │  │
+ │                              ▼                                       │  │
+ │         ┌─────────────────────────────────────┐                     │  │
+ │         │     Redis List: oast:callbacks       │                     │  │
+ │         │     (LPUSH serialized callback)      │                     │  │
+ │         └─────────────────────┬───────────────┘                     │  │
+ │                               │                                      │  │
+ │                               │ BRPOP (blocking pop)                 │  │
+ │                               ▼                                      │  │
+ │         ┌──────────────────────────────────────────────────┐        │  │
+ │         │            CORRELATOR (correlator.py)             │        │  │
+ │         │                                                    │        │  │
+ │         │  1. Pop callback from oast:callbacks               │        │  │
+ │         │  2. Extract unique_id from URL path / subdomain    │        │  │
+ │         │  3. Check Redis: oast:payload:{unique_id}          │        │  │
+ │         │     ┌──────────┐    ┌────────────┐                │        │  │
+ │         │     │  FOUND   │    │ NOT FOUND  │                │        │  │
+ │         │     └────┬─────┘    └─────┬──────┘                │        │  │
+ │         │          │                │                        │        │  │
+ │         │          ▼                ▼                        │        │  │
+ │         │  4a. Check TTL       4b. Log "unknown             │        │  │
+ │         │      expiry              callback" &              │        │  │
+ │         │      ┌─────┐             discard                  │        │  │
+ │         │      │OK?  │                                      │        │  │
+ │         │      └──┬──┘                                      │        │  │
+ │         │    yes  │  no→ log "expired" & discard            │        │  │
+ │         │         ▼                                         │        │  │
+ │         │  5. Dedup check: oast:seen:{callback_hash}        │        │  │
+ │         │     if seen → log "duplicate" & skip              │        │  │
+ │         │     else → mark seen (SADD)                       │        │  │
+ │         │         │                                         │        │  │
+ │         │         ▼                                         │        │  │
+ │         │  6. Build Finding → push to results:incoming      │        │  │
+ │         │  7. Update stats counters                         │        │  │
+ │         └──────────────────────────────────────────────────┘        │  │
+ │                               │                                      │  │
+ │                               ▼                                      │  │
+ │         ┌──────────────────────────────────────┐                    │  │
+ │         │  Redis List: results:incoming          │                    │  │
+ │         │  (TaskResult with status "COMPLETED")  │                    │  │
+ │         └──────────────────────────────────────┘                    │  │
+ │                                                                         │
+ │  ┌──────────────────────────────────────────────────────────────┐   │  │
+ │  │  PAYLOAD GENERATOR (called by fuzzer/sniper externally)      │   │  │
+ │  │                                                                │   │  │
+ │  │  generate_payload(task_id, scan_id, vuln_type)                 │   │  │
+ │  │    → unique_id = f"{scan_id}_{vuln_type}_{uuid4_short}"       │   │  │
+ │  │    → Store in Redis: oast:payload:{unique_id}                  │   │  │
+ │  │         { task_id, scan_id, vuln_type, created_at }            │   │  │
+ │  │         TTL = config.redis.ttl (86400s default)                │   │  │
+ │  │    → Return PayloadInfo(subdomain, url, unique_id)             │   │  │
+ │  └──────────────────────────────────────────────────────────────┘   │  │
+ └─────────────────────────────────────────────────────────────────────────┘
+
+ EXTERNAL CALLERS:
+ ┌───────────────────┐        ┌────────────────────┐
+ │  Smart Fuzzer      │        │  Nuclei Sniper      │
+ │  (modules/fuzzer/) │        │  (modules/sniper/)  │
+ │                     │        │                      │
+ │  from modules.      │        │  from modules.       │
+ │   oast_listener     │        │   oast_listener      │
+ │   import            │        │   import             │
+ │   generate_payload  │        │   generate_payload   │
+ │                     │        │                      │
+ │  p = generate_      │        │  p = generate_       │
+ │   payload(...)      │        │   payload(...)        │
+ │  inject(p.url)      │        │  inject(p.url)        │
+ └───────────────────┘        └────────────────────┘
