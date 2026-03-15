@@ -1,0 +1,230 @@
+Edge Cases
+See the edge case table in the module docstrings for comprehensive handling.
+
+text
+
+
+---
+
+## Deep Dive Post-Mortem (DNA)
+
+### ASCII Diagram: CLI Flow
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ CENTAUR-JARVIS CLI FLOW │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+User invokes CLI
+│
+▼
+┌──────────────┐ ┌──────────────┐
+│ Parse Args │─────►│ Load Config │
+│ (click) │ │ (YAML+merge) │
+└──────┬───────┘ └──────┬───────┘
+│ │
+▼ ▼
+┌──────────────┐ ┌─────────────────────┐
+│ --list-prof? │──►│ Print profiles; exit│
+│ --export? │──►│ Export JSON; exit │
+│ --resume? │──►│ Load state → _run │
+└──────┬───────┘ └─────────────────────┘
+│ (new scan)
+▼
+┌─────────────────┐ ┌──────────────────┐
+│ Resolve Targets │────►│ Concurrency Lock │
+│ (URL/file/CSV) │ │ (PID file check) │
+└──────┬──────────┘ └──────┬───────────┘
+│ │
+▼ ▼
+┌─────────────────────────────────────────┐
+│ _run_scan() │
+│ │
+│ 1. ProcessManager.ensure_service() │
+│ ┌──────────────────────────┐ │
+│ │ Redis running? │──No──► Start Redis
+│ │ Orchestrator heartbeat? │──No──► Start orchestrator
+│ │ Workers alive? │──No──► Start workers
+│ └──────────────────────────┘ │
+│ │
+│ 2. ScanController(scan_id, targets) │
+│ │
+│ 3. LiveDashboard (optional) │
+│ ┌─────────────────────┐ │
+│ │ Main thread: render │◄─┐ │
+│ └─────────────────────┘ │ │
+│ ┌─────────────────────┐ │ │
+│ │ BG thread: scan.run │──┘ (data) │
+│ └────────┬────────────┘ │
+│ │ │
+│ 4. Signal handler → shutdown_event │
+│ │
+│ 5. Scan Phases: │
+│ ┌────────┐ ┌────────┐ ┌────────┐ │
+│ │ RECON │─►│ FUZZ │─►│ SNIPER │ │
+│ └────┬───┘ └────┬───┘ └────┬───┘ │
+│ │ │ │ │
+│ ┌────▼───────────▼───────────▼────┐ │
+│ │ Push tasks → Redis queues │ │
+│ │ Poll statuses every 2s │ │
+│ │ Consume results queue │ │
+│ │ Update findings/stats │ │
+│ └─────────────────────────────────┘ │
+│ │
+│ 6. Post-scan: │
+│ ┌─────────────────────────────────┐ │
+│ │ If paused: │ │
+│ │ Save state → JSON file │ │
+│ │ Print resume command │ │
+│ │ If completed: │ │
+│ │ Generate report (HTML+JSON) │ │
+│ │ Cleanup locks & processes │ │
+│ └─────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+
+RESUME FLOW:
+┌────────────────┐ ┌─────────────────┐ ┌──────────────────┐
+│ --resume ID │────►│ StateManager │────►│ Load SCAN.json │
+│ │ │ .load_state() │ │ Restore phases, │
+│ │ │ │ │ findings, tasks │
+└────────────────┘ └─────────────────┘ └────────┬─────────┘
+│
+▼
+┌──────────────────┐
+│ Skip completed │
+│ phases & tasks │
+│ Re-push pending │
+│ (dedup via IDs) │
+└──────────────────┘
+
+SHUTDOWN FLOW (Ctrl+C):
+┌──────────────┐ ┌────────────────────┐ ┌───────────────────┐
+│ SIGINT/TERM │────►│ _shutdown_handler │────►│ controller. │
+│ received │ │ in main.py │ │ request_shutdown()│
+└──────────────┘ └────────────────────┘ └────────┬──────────┘
+│
+┌───────────────────────────────────┘
+▼
+┌──────────────┐ ┌─────────────────┐
+│ _wait_phase │────►│ Exits poll loop │
+│ sees event │ │ phase incomplete │
+└──────────────┘ └────────┬────────┘
+│
+┌──────────────────────┘
+▼
+┌──────────────┐ ┌─────────────────────┐
+│ Finally │────►│ StateManager.save() │
+│ block │ │ ProcessMgr.stop_all()│
+└──────────────┘ │ Release scan locks │
+└─────────────────────┘
+
+text
+
+
+### Graceful Shutdown Mechanism
+
+The graceful shutdown is a multi-layered system:
+
+1. **Signal Registration** (`main.py`): Python `signal.signal()` registers handlers for `SIGINT` and `SIGTERM`. The handler calls `controller.request_shutdown()` which sets a `threading.Event`.
+
+2. **Phase Polling Loop** (`scan_controller.py:_wait_for_phase`): Every 2 seconds, the loop checks `self._shutdown_requested.is_set()`. When set, the loop exits immediately, returning `False` to indicate incomplete phase.
+
+3. **Main Run Loop** (`scan_controller.py:run`): After a phase returns `False` due to shutdown, the main loop breaks out of the phase iteration. The controller's `is_paused` property returns `True` (shutdown requested + current_phase still set).
+
+4. **Finally Block** (`main.py:_run_scan`): In the finally block:
+   - If `controller.is_paused`: `StateManager.save_state()` writes the full state to `~/.centaur/scans/SCAN_ID.json`.
+   - The dashboard is stopped (terminal restored by rich's context manager).
+   - `ProcessManager.stop_all()` sends SIGTERM to all managed processes, waits `kill_timeout` seconds, then sends SIGKILL to any that haven't exited (edge case #16).
+   - Scan lock files are removed.
+
+5. **State Persistence** (`state_manager.py`): Atomic write via temporary file + rename. Falls back to `/tmp/centaur_scans/` if primary directory is not writable (edge case #11). State includes all findings, pending tasks, queued task IDs, and phase completion status.
+
+6. **Resume** (`main.py:_run_resume`): Loads state, creates a new `ScanController` with `resume_state`, which calls `_restore_state()` to rebuild internal tracking sets. Completed task IDs prevent re-pushing (edge case #8). The orchestrator also deduplicates, so re-pushing is safe even if IDs overlap.
+
+### Edge Cases Mitigated
+
+| # | Edge Case | Mitigation | Code Reference |
+|---|-----------|-----------|----------------|
+| 1 | Redis not running on start | `ProcessManager.ensure_redis()` tries `redis-server --daemonize` then Docker; clear error if fails | `process_manager.py:ensure_redis()` |
+| 2 | Service crashes during scan | `ProcessManager.health_check()` detects dead processes; `restart_crashed()` restarts them | `process_manager.py:health_check(), restart_crashed()` |
+| 3 | Network partition / Redis unreachable | `_push_task()` uses `@retry` with exponential backoff (5 attempts); `_push_task_safe()` buffers on failure | `scan_controller.py:_push_task(), _push_task_safe()` |
+| 4 | Target unreachable (all tasks fail) | Failed tasks tracked in `_failed_task_ids`; errors logged; scan continues with other targets; report includes failures | `scan_controller.py:_process_result()` |
+| 5 | AI provider fails (Ollama down) | Profile-based fallback: `quick` profile uses only deterministic Nuclei; no AI dependency | `config.yaml` profiles; handled by backend modules |
+| 6 | RAG search times out | Backend modules handle RAG timeouts; CLI proceeds regardless; stats track `rag_snippets=0` | Handled by backend modules; CLI is agnostic |
+| 7 | Ctrl+C during live display | Signal handler in `main.py` sets shutdown event; `rich.Live` context manager restores terminal; finally block saves state | `main.py:_shutdown_handler()`, `live_display.py:run_with_scan()` |
+| 8 | Resume after crash – tasks already in Redis | `_make_task_id()` generates deterministic IDs; `_completed_task_ids` set restored from state; skip already-done tasks | `scan_controller.py:_make_task_id(), _run_recon_phase()` |
+| 9 | Large findings set in live display | `max_visible_findings` config limits display; `get_recent_findings(n)` returns only last N | `live_display.py:_make_findings_panel()`, `scan_controller.py:get_recent_findings()` |
+| 10 | Multiple CLI instances conflicting | PID-based lockfile per target; checks if locking PID is alive; removes stale locks | `main.py:check_concurrent_scan(), release_scan_locks()` |
+| 11 | Disk full during state save | Atomic write with temp file; tries fallback directory (`/tmp/centaur_scans`); clear error if both fail | `state_manager.py:save_state(), _get_writable_dir()` |
+| 12 | Report generation fails (template missing) | `_generate_report_safe()` catches ImportError and exceptions; falls back to JSON dump | `main.py:_generate_report_safe(), _fallback_report()` |
+| 13 | Target list file not found | `resolve_targets()` checks `path.exists()` + `is_file()`; clear error + `sys.exit(1)` on OSError | `main.py:resolve_targets()` |
+| 14 | Invalid scan profile in config | Falls back to 'full' profile; warns user; `load_config()` deep-merges with hardcoded defaults | `main.py:cli()` profile validation, `load_config()` |
+| 15 | Pause with stuck processing tasks | Tasks tracked as `processing_tasks` in state; orchestrator timeout monitor will eventually requeue them; safe to re-push on resume | `scan_controller.py:get_state()` |
+| 16 | Child processes hang after Ctrl+C | `ProcessManager.stop_all()`: SIGTERM → wait `kill_timeout` → SIGKILL; uses `os.killpg()` for process groups | `process_manager.py:stop_all()` |
+| 17 | Terminal window resized | `rich` handles terminal resize automatically; no custom code needed | Built into `rich.Live` |
+| 18 | No permissions to start Redis/workers | `PermissionError` caught in `_start_service()`; suggests `--manual` mode; exits gracefully | `process_manager.py:_start_service()`, `main.py:_run_scan()` |
+
+### Remaining Loopholes & Future Improvements
+
+| Area | Current Limitation | Future Improvement |
+|------|-------------------|-------------------|
+| **Web UI** | Terminal-only dashboard | Add a Flask/FastAPI web server with WebSocket dashboard for remote access |
+| **Multi-user** | Single-user PID-based locking | Redis-based distributed locking with user authentication |
+| **Scan scheduling** | Manual invocation only | Cron-like scheduler or webhook-triggered scans |
+| **Parallel targets** | Sequential target processing | Parallel scan controller with per-target worker pools |
+| **Notification** | Config-only Discord/Slack webhooks | Pluggable notification system (email, PagerDuty, Telegram) |
+| **Rate limiting** | No global rate limiting | Add request rate limiter to prevent target overload |
+| **Scan comparison** | No diff capability | Compare findings across scans for regression detection |
+| **Plugin system** | Hardcoded phase runners | Dynamic phase loading from plugins directory |
+| **Windows support** | Unix signals (SIGTERM/SIGKILL) | Conditional Windows support with `GenerateConsoleCtrlEvent` |
+| **State encryption** | Plaintext JSON state files | Encrypt state files containing potentially sensitive target data |
+| **Large-scale** | Single Redis instance | Redis Cluster support for distributed scanning |
+| **Dashboard history** | Live-only display | Scrollable history, finding detail drill-down |
+
+### Performance Considerations
+
+1. **Live Display Thread**: The dashboard renders in the main thread every `refresh_interval` (default 2s). Each render queries the `ScanController` for stats, findings, and errors via thread-safe methods (using `threading.Lock`). Rich's `Live` handles the actual terminal I/O efficiently with differential updates.
+
+2. **Redis Polling Frequency**: Task status polling occurs every 2 seconds in `_wait_for_phase()`. Queue length queries for the dashboard also happen every 2 seconds. Both use Redis `pipeline()` to batch commands, reducing round trips. For a scan with ~100 tasks, this means ~50 Redis commands per poll cycle (pipeline batched into 1-2 round trips).
+
+3. **Results Consumption**: `_consume_results()` drains the results queue in a tight loop (non-blocking `LPOP`). This ensures findings appear in the dashboard promptly. In high-throughput scenarios (~1000 results/sec), the consumption loop may take up to 100ms per cycle.
+
+4. **State Auto-Save**: The controller auto-saves state every `auto_save_interval` (default 30s) during phase waits. The atomic write (temp file + rename) takes ~1-5ms for typical state sizes (<10MB). The state file grows linearly with findings count; for very large scans (>10K findings), consider streaming findings to a separate file.
+
+5. **Memory**: All findings are held in memory in the `ScanController.findings` list. For scans producing >100K findings, this could consume significant RAM. Future improvement: stream findings to SQLite or a Redis sorted set, keeping only recent N in memory.
+
+6. **Process Manager Health Checks**: Not automatically periodic in the current design. The dashboard or controller should call `health_check()` every ~30 seconds. Currently, service crashes are detected primarily when task pushes fail or heartbeats expire.
+
+### Integration Notes
+
+1. **Backend Module Communication**: The CLI communicates with all backend modules exclusively via Redis queues. Tasks are pushed to `queue:recon`, `queue:smart_fuzzer`, `queue:sniper`. Results are consumed from `results:{scan_id}`. Task statuses are tracked via `task:status:{task_id}` keys.
+
+2. **Task Format**: Tasks pushed by the CLI follow the schema:
+   ```json
+   {
+     "task_id": "task_<deterministic_uuid>",
+     "scan_id": "SCAN_XXXX",
+     "type": "RECON_NUCLEI",
+     "target": "https://example.com",
+     "params": {"tool": "nuclei", "profile": "full"},
+     "created_at": "ISO8601"
+   }
+Status Strings: All status strings are UPPERCASE (QUEUED, PROCESSING, COMPLETED, FAILED) to match shared.schemas.TaskStatus.
+
+Result Format: Results consumed from Redis must include a data field:
+
+JSON
+
+{
+  "task_id": "task_xxx",
+  "status": "COMPLETED",
+  "data": {
+    "findings": [...],
+    "endpoints": [...],
+    "requests_sent": 42,
+    "ai_calls": 2
+  }
+}
+Config File Location: The CLI loads config.yaml from the same directory as main.py (i.e., cli/config.yaml). Override with --config /path/to/config.yaml.
+
+Reporting Module: The CLI calls modules.reporting.generator.generate_report(scan_id, output_dir) if available. If the module is not installed or fails, a hardcoded JSON fallback report is generated.
+
+AI Router: The CLI does not directly call the AI Router. AI integration happens within the backend modules (smart_fuzzer, orchestrator). The CLI only tracks ai_calls and rag_snippets counts from result data.
