@@ -1,123 +1,118 @@
-# =============================================================================
+# ==============================================================================
 # Centaur-Jarvis CLI Configuration
-# =============================================================================
-# This file defines scan profiles, Redis connection, notification hooks,
-# process management settings, and display preferences.
-# Location: cli/config.yaml (loaded relative to cli/ package directory)
-# Override: CLI flags override profile settings at runtime.
-# =============================================================================
+# ==============================================================================
 
+# --- Scan Profiles ---
+profiles:
+  quick:
+    description: "Fast reconnaissance-only scan"
+    phases: ["recon"]
+    recon_tasks: ["nuclei"]
+    fuzzing:
+      enabled: false
+    sniper:
+      enabled: false
+    timeout_minutes: 15
+
+  full:
+    description: "Comprehensive multi-phase scan"
+    phases: ["recon", "fuzzing", "sniper"]
+    recon_tasks: ["subfinder", "httpx", "nuclei", "nmap", "katana"]
+    fuzzing:
+      enabled: true
+      vuln_types: ["xss", "sqli", "ssti", "ssrf", "lfi"]
+      max_iterations: 3
+      timeout_per_param: 120
+    sniper:
+      enabled: true
+      feeds: ["github", "packetstorm", "exploitdb"]
+      auto_verify: true
+    timeout_minutes: 120
+
+  recon_only:
+    description: "Deep reconnaissance without active testing"
+    phases: ["recon"]
+    recon_tasks: ["subfinder", "httpx", "nuclei", "nmap", "katana", "wafw00f"]
+    fuzzing:
+      enabled: false
+    sniper:
+      enabled: false
+    timeout_minutes: 30
+
+  custom:
+    description: "User-configurable profile (override via CLI flags)"
+    phases: ["recon"]
+    recon_tasks: ["nuclei"]
+    fuzzing:
+      enabled: false
+    sniper:
+      enabled: false
+    timeout_minutes: 60
+
+# --- Display Settings ---
+display:
+  refresh_interval: 2          # Dashboard refresh rate in seconds
+  max_events: 50               # Maximum events shown in live feed
+  max_activities: 8            # Maximum concurrent activities shown
+  max_errors: 20               # Maximum errors shown in error panel
+  show_tool_summaries: true    # Show aggregated tool statistics
+  show_queue_status: true      # Show Redis queue lengths
+  error_panel: true            # Show dedicated error panel
+  verbose: false               # Verbose event output
+  hacker_theme: true           # Green/cyan/red color scheme
+  show_banner: true            # Show ASCII art banner on start
+  spinner_style: "dots"        # Rich spinner style
+
+# --- Redis Connection ---
 redis:
   host: "127.0.0.1"
   port: 6379
   db: 0
+  password: null
   socket_timeout: 5
   retry_on_timeout: true
-  health_check_interval: 30
+  max_retries: 3
+  retry_delay: 2
 
-state:
-  # Directory for saving scan state files
-  # Supports ~ expansion and environment variables
-  directory: "~/.centaur/scans"
-  # Fallback if primary directory is not writable
-  fallback_directory: "/tmp/centaur_scans"
-  # Auto-save interval in seconds during active scan
-  auto_save_interval: 30
-
-reports:
-  output_directory: "reports/"
-  formats: ["html", "json"]
-  # Include raw findings data in JSON report
-  include_raw_data: true
-
+# --- Process Management ---
 processes:
-  # Heartbeat timeout: consider a service dead after this many seconds
-  heartbeat_timeout: 30
-  # After sending SIGTERM, wait this long before SIGKILL
-  kill_timeout: 10
-  # PID file directory
-  pid_directory: "~/.centaur/pids"
-  # Commands to start each service (auto mode)
-  services:
-    orchestrator:
-      command: "python -m modules.orchestrator.main"
-      heartbeat_key: "heartbeat:orchestrator"
-      queue: "queue:orchestrator"
-    recon_worker:
-      command: "python -m modules.recon.worker"
-      heartbeat_key: "heartbeat:recon_worker"
-      queue: "queue:recon"
-    smart_fuzzer:
-      command: "python -m modules.smart_fuzzer.main"
-      heartbeat_key: "heartbeat:smart_fuzzer"
-      queue: "queue:smart_fuzzer"
-    sniper:
-      command: "python -m modules.sniper.main"
-      heartbeat_key: "heartbeat:sniper"
-      queue: "queue:sniper"
+  orchestrator:
+    module: "modules.orchestrator.main"
+    required: true
+    restart_on_crash: true
+    max_restarts: 3
+  recon_worker:
+    module: "modules.recon.worker"
+    required: true
+    restart_on_crash: true
+    max_restarts: 3
+  fuzzer_worker:
+    module: "modules.fuzzer.worker"
+    required: false
+    restart_on_crash: true
+    max_restarts: 3
+  sniper_worker:
+    module: "modules.sniper.worker"
+    required: false
+    restart_on_crash: true
+    max_restarts: 3
 
-profiles:
-  quick:
-    description: "Fast recon-only scan with Nuclei critical templates"
-    phases: ["recon"]
-    recon_tasks: ["nuclei"]
-    fuzzing:
-      enabled: false
-    sniper:
-      enabled: false
-    timeout: 600  # 10 minutes max
+# --- State Management ---
+state:
+  save_directory: ".jarvis_state"
+  auto_save_interval: 30       # seconds between auto-saves
+  max_state_files: 20          # keep last N state files
+  fallback_directory: "/tmp/jarvis_state"
 
-  full:
-    description: "Complete scan: recon + fuzzing + sniper + reporting"
-    phases: ["recon", "fuzzing", "sniper"]
-    recon_tasks: ["subfinder", "httpx", "nuclei"]
-    fuzzing:
-      enabled: true
-      vuln_types: ["xss", "sqli", "ssti"]
-      max_iterations: 3
-    sniper:
-      enabled: true
-      feeds: ["github", "packetstorm"]
-    timeout: 7200  # 2 hours max
-
-  recon_only:
-    description: "Comprehensive reconnaissance without active testing"
-    phases: ["recon"]
-    recon_tasks: ["subfinder", "httpx", "nuclei"]
-    fuzzing:
-      enabled: false
-    sniper:
-      enabled: false
-    timeout: 1800  # 30 minutes
-
-  custom:
-    description: "Customizable profile – override via CLI flags"
-    phases: ["recon"]
-    recon_tasks: ["nuclei"]
-    fuzzing:
-      enabled: false
-    sniper:
-      enabled: false
-    timeout: 3600
-
+# --- Notifications (Future) ---
 notifications:
-  # Discord webhook (leave empty to disable)
-  discord_webhook: ""
-  # Slack webhook (leave empty to disable)
-  slack_webhook: ""
-  # Only notify for these severities
-  notify_severities: ["CRITICAL", "HIGH"]
-  # Rate limit: max one notification per N seconds
-  rate_limit_seconds: 10
+  enabled: false
+  webhook_url: null
+  notify_on: ["critical_finding", "scan_complete", "scan_error"]
 
-display:
-  # Dashboard refresh interval in seconds
-  refresh_interval: 2
-  # Maximum findings shown in live table
-  max_visible_findings: 50
-  # Show queue lengths in dashboard
-  show_queues: true
-  # Show error log panel
-  show_errors: true
-  # Maximum errors shown
-  max_visible_errors: 20
+# --- Logging ---
+logging:
+  level: "INFO"
+  file: "logs/cli.log"
+  max_size_mb: 50
+  backup_count: 5
