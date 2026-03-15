@@ -1,413 +1,554 @@
 """
-Live Display
-============
-Real-time terminal dashboard using the ``rich`` library.
+Advanced Live Display – Hacker-style real-time terminal dashboard.
 
-Dashboard layout:
-┌─────────────────────────────────────────────────────┐
-│  CENTAUR-JARVIS  │ Scan: SCAN_XXX │ Target │ Status │  ← Header
-├─────────────────────────────────────────────────────┤
-│ Phase Progress                                      │  ← Phases panel
-│  [✓] recon   [►] fuzzing [37%]   [ ] sniper        │
-├───────────────────────┬─────────────────────────────┤
-│ Latest Findings       │ Stats                       │
-│ CRITICAL xss /login   │ Tasks:  12/15               │
-│ HIGH     sqli /api    │ Findings: 7                 │
-│ ...                   │ AI calls: 3                 │
-├───────────────────────┴─────────────────────────────┤
-│ Queues: recon=0  fuzzer=3  sniper=0  results=1      │
-├─────────────────────────────────────────────────────┤
-│ Errors (last 5)                                     │
-│ [12:03] Task xyz failed: timeout                    │
-└─────────────────────────────────────────────────────┘
+Features:
+- ASCII art banner with animated glow
+- Current activity panel with spinners
+- Live event feed with color-coded entries
+- Statistics and tool summary panels
+- Error panel with timestamps
+- Queue status bar
+- Auto-refresh every N seconds via rich.live.Live
+- Handles terminal resize automatically (rich built-in)
 
-Edge cases handled:
-    #7  – Ctrl+C during live display → graceful stop, terminal restored
-    #9  – Large findings set → limited to max_visible_findings
-    #17 – Terminal resize → rich handles automatically
+Edge Cases Handled:
+- Terminal too narrow → graceful degradation
+- No events → "Waiting for activity..." placeholder
+- Unicode errors → fallback to ASCII
+- Keyboard interrupt during display → clean shutdown
 """
 
-import logging
-import threading
 import time
-from typing import Optional
-
-logger = logging.getLogger("cli.live_display")
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
 
 try:
     from rich.console import Console
-    from rich.layout import Layout
     from rich.live import Live
-    from rich.panel import Panel
-    from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TaskID
     from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
     from rich.text import Text
+    from rich.columns import Columns
+    from rich.align import Align
+    from rich.spinner import Spinner
+    from rich.padding import Padding
+    from rich import box
 
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
-    logger.warning("rich library not installed. Live dashboard disabled.")
 
 
-class LiveDashboard:
-    """Real-time scan dashboard powered by rich."""
+# ── Banner ────────────────────────────────────────────────────────────
 
-    SEVERITY_COLORS = {
-        "CRITICAL": "bold red",
-        "HIGH": "red",
-        "MEDIUM": "yellow",
-        "LOW": "blue",
-        "INFO": "dim",
-    }
+BANNER_ART = r"""
+ ██████╗███████╗███╗   ██╗████████╗ █████╗ ██╗   ██╗██████╗ 
+██╔════╝██╔════╝████╗  ██║╚══██╔══╝██╔══██╗██║   ██║██╔══██╗
+██║     █████╗  ██╔██╗ ██║   ██║   ███████║██║   ██║██████╔╝
+██║     ██╔══╝  ██║╚██╗██║   ██║   ██╔══██║██║   ██║██╔══██╗
+╚██████╗███████╗██║ ╚████║   ██║   ██║  ██║╚██████╔╝██║  ██║
+ ╚═════╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝
+       ╔═══════════════════════════════════════╗
+       ║   J A R V I S  •  V A P T  A G E N T ║
+       ╚═══════════════════════════════════════╝"""
+
+BANNER_FALLBACK = """
+=== CENTAUR-JARVIS VAPT AGENT ===
+"""
+
+
+# ── Event Type Icons & Colors ─────────────────────────────────────────
+
+EVENT_STYLES = {
+    "info": {"icon": "ℹ ", "color": "cyan"},
+    "success": {"icon": "✔ ", "color": "green"},
+    "discovery": {"icon": "🔍", "color": "green"},
+    "warning": {"icon": "⚠ ", "color": "yellow"},
+    "critical": {"icon": "❗", "color": "bold red"},
+    "phase": {"icon": "▶ ", "color": "bold magenta"},
+    "error": {"icon": "✘ ", "color": "red"},
+}
+
+
+class LiveDisplay:
+    """
+    Real-time hacker-style terminal dashboard using Rich library.
+    
+    Renders a continuously-updating display showing scan progress,
+    current activities, live events, statistics, and errors.
+    """
 
     def __init__(
         self,
-        scan_id: str,
-        targets: list,
-        profile_name: str,
-        config: dict,
-        controller=None,
+        scan_controller,
+        display_config: Dict[str, Any],
+        verbose: bool = False,
     ):
-        self.scan_id = scan_id
-        self.targets = targets
-        self.profile_name = profile_name
-        self._config = config
-        self._controller = controller
-
-        display_cfg = config.get("display", {})
-        self._refresh_interval = display_cfg.get("refresh_interval", 2)
-        self._max_findings = display_cfg.get("max_visible_findings", 50)
-        self._show_queues = display_cfg.get("show_queues", True)
-        self._show_errors = display_cfg.get("show_errors", True)
-        self._max_errors = display_cfg.get("max_visible_errors", 20)
-
-        self._console = Console() if HAS_RICH else None
-        self._stop_event = threading.Event()
-        self._live: Optional[Live] = None
-
-    # ------------------------------------------------------------------
-    # Main entry: run dashboard alongside scan controller
-    # ------------------------------------------------------------------
-    def run_with_scan(self, controller) -> None:
         """
-        Run the scan controller in a background thread while displaying
-        the live dashboard in the main thread.
-
-        Edge case #7: Ctrl+C is handled by the signal handler in main.py,
-        which calls controller.request_shutdown(), causing both threads
-        to stop gracefully.
+        Args:
+            scan_controller: ScanController instance for data
+            display_config: Display settings from config.yaml
+            verbose: Show more detailed events
         """
-        if not HAS_RICH:
-            logger.warning("rich not available. Running scan without dashboard.")
-            controller.run()
-            return
+        self.controller = scan_controller
+        self.config = display_config
+        self.verbose = verbose or display_config.get("verbose", False)
+        self.refresh_interval = display_config.get("refresh_interval", 2)
+        self.show_tool_summaries = display_config.get("show_tool_summaries", True)
+        self.show_queue_status = display_config.get("show_queue_status", True)
+        self.show_error_panel = display_config.get("error_panel", True)
+        self.hacker_theme = display_config.get("hacker_theme", True)
+        self.show_banner = display_config.get("show_banner", True)
 
-        self._controller = controller
+        self._console: Optional[Any] = None
+        self._live: Optional[Any] = None
 
-        # Start scan in background thread
-        scan_thread = threading.Thread(
-            target=self._scan_runner,
-            args=(controller,),
-            daemon=True,
-            name="scan-controller",
-        )
-        scan_thread.start()
+        if HAS_RICH:
+            self._console = Console()
+        else:
+            print("[WARNING] 'rich' not installed. Using plain text output.")
 
-        # Run dashboard in main thread (for terminal control)
-        try:
-            self._run_dashboard()
-        except KeyboardInterrupt:
-            logger.debug("KeyboardInterrupt in dashboard (already handled by signal handler).")
-        finally:
-            # Wait for scan thread to finish
-            self._stop_event.set()
-            scan_thread.join(timeout=10)
-
-    def _scan_runner(self, controller) -> None:
-        """Background thread that runs the scan controller."""
-        try:
-            controller.run()
-        except Exception as exc:
-            logger.error("Scan controller crashed: %s", exc, exc_info=True)
-        finally:
-            self._stop_event.set()
-
-    # ------------------------------------------------------------------
-    # Dashboard rendering loop
-    # ------------------------------------------------------------------
-    def _run_dashboard(self) -> None:
-        """Main dashboard loop using rich.Live."""
-        with Live(
-            self._render(),
-            console=self._console,
-            refresh_per_second=1,
-            screen=False,
-            transient=False,
-        ) as live:
-            self._live = live
-            while not self._stop_event.is_set():
-                try:
-                    live.update(self._render())
-                except Exception as exc:
-                    logger.debug("Dashboard render error: %s", exc)
-                time.sleep(self._refresh_interval)
-
-            # Final render
-            try:
-                live.update(self._render())
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # Layout construction
-    # ------------------------------------------------------------------
-    def _render(self) -> Layout:
+    def render_dashboard(self) -> Any:
         """Build the complete dashboard layout."""
+        if not HAS_RICH:
+            return self._render_plain()
+
         layout = Layout()
 
-        layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="phases", size=5),
-            Layout(name="body", ratio=1),
-            Layout(name="footer", size=3) if self._show_queues else Layout(name="spacer", size=1),
-        )
+        # Build sections
+        sections = []
 
-        if self._show_errors:
-            layout["body"].split_row(
-                Layout(name="findings", ratio=3),
-                Layout(name="sidebar", ratio=1),
+        # 1. Banner (compact)
+        if self.show_banner:
+            sections.append(Layout(self._build_banner(), name="banner", size=9))
+
+        # 2. Scan info bar
+        sections.append(Layout(self._build_scan_info(), name="scaninfo", size=3))
+
+        # 3. Activities panel
+        sections.append(Layout(self._build_activities(), name="activities", size=None, minimum_size=5))
+
+        # 4. Events panel
+        sections.append(Layout(self._build_events(), name="events", size=None, minimum_size=8))
+
+        # 5. Stats + Tool summaries (side by side)
+        if self.show_tool_summaries:
+            stats_layout = Layout(name="stats_row", size=8)
+            stats_layout.split_row(
+                Layout(self._build_stats(), name="stats"),
+                Layout(self._build_tool_summaries(), name="summaries"),
             )
-            layout["sidebar"].split_column(
-                Layout(name="stats", ratio=1),
-                Layout(name="errors", ratio=1),
-            )
+            sections.append(stats_layout)
         else:
-            layout["body"].split_row(
-                Layout(name="findings", ratio=3),
-                Layout(name="stats", ratio=1),
-            )
+            sections.append(Layout(self._build_stats(), name="stats", size=8))
 
-        # Fill panels
-        layout["header"].update(self._make_header())
-        layout["phases"].update(self._make_phases_panel())
-        layout["findings"].update(self._make_findings_panel())
+        # 6. Error panel
+        if self.show_error_panel:
+            errors = self.controller.errors.get_all()
+            if errors:
+                sections.append(
+                    Layout(self._build_errors(), name="errors", size=min(6, len(errors) + 2))
+                )
 
-        if self._show_errors:
-            layout["stats"].update(self._make_stats_panel())
-            layout["errors"].update(self._make_errors_panel())
-        else:
-            layout["stats"].update(self._make_stats_panel())
+        # 7. Queue status bar
+        if self.show_queue_status:
+            sections.append(Layout(self._build_queue_status(), name="queue", size=3))
 
-        if self._show_queues:
-            layout["footer"].update(self._make_queues_panel())
-
+        layout.split_column(*sections)
         return layout
 
-    # ------------------------------------------------------------------
-    # Panel builders
-    # ------------------------------------------------------------------
-    def _make_header(self) -> Panel:
-        """Header panel with scan ID, target, elapsed time, status."""
-        if self._controller is None:
-            status_text = "INITIALIZING"
-            elapsed = 0
-        else:
-            status_text = self._controller.status
-            elapsed = self._controller.elapsed_seconds
+    # ── Panel Builders ────────────────────────────────────────────────
 
-        target_display = self.targets[0] if self.targets else "N/A"
-        if len(self.targets) > 1:
-            target_display += f" (+{len(self.targets) - 1} more)"
+    def _build_banner(self) -> Panel:
+        """Build ASCII art banner."""
+        try:
+            banner_text = Text(BANNER_ART, style="bold red")
+        except Exception:
+            banner_text = Text(BANNER_FALLBACK, style="bold red")
 
-        elapsed_str = _format_duration(elapsed)
+        return Panel(
+            Align.center(banner_text),
+            border_style="red",
+            box=box.DOUBLE,
+            padding=(0, 0),
+        )
+
+    def _build_scan_info(self) -> Panel:
+        """Build scan metadata info bar."""
+        c = self.controller
+        elapsed = c.get_elapsed_time()
+        target_display = c.targets[0] if c.targets else "N/A"
+        if len(c.targets) > 1:
+            target_display += f" (+{len(c.targets) - 1} more)"
 
         status_color = {
             "RUNNING": "green",
-            "PAUSED": "yellow",
             "COMPLETED": "bold green",
-            "SHUTTING_DOWN": "bold yellow",
             "FAILED": "bold red",
-        }.get(status_text, "white")
+            "PAUSED": "yellow",
+            "PENDING": "dim",
+        }.get(c.status, "white")
 
-        header = Text()
-        header.append("🛡️  CENTAUR-JARVIS", style="bold cyan")
-        header.append("  │  ", style="dim")
-        header.append(f"Scan: {self.scan_id}", style="bold white")
-        header.append("  │  ", style="dim")
-        header.append(f"Target: {target_display}", style="white")
-        header.append("  │  ", style="dim")
-        header.append(f"Profile: {self.profile_name}", style="magenta")
-        header.append("  │  ", style="dim")
-        header.append(f"⏱ {elapsed_str}", style="white")
-        header.append("  │  ", style="dim")
-        header.append(f"Status: {status_text}", style=status_color)
+        info = Text()
+        info.append("  Scan: ", style="dim")
+        info.append(c.scan_id, style="bold cyan")
+        info.append("  │  Target: ", style="dim")
+        info.append(target_display, style="bold white")
+        info.append("  │  Profile: ", style="dim")
+        info.append(c.profile_name, style="bold yellow")
+        info.append("  │  Phase: ", style="dim")
+        info.append(c.current_phase.upper() or "INIT", style="bold magenta")
+        info.append("  │  Elapsed: ", style="dim")
+        info.append(elapsed, style="bold green")
+        info.append("  │  Status: ", style="dim")
+        info.append(c.status, style=status_color)
 
-        return Panel(header, style="bold blue")
+        return Panel(info, border_style="cyan", box=box.ROUNDED, padding=(0, 0))
 
-    def _make_phases_panel(self) -> Panel:
-        """Phase progress with checkmarks and progress bars."""
-        if self._controller is None:
-            return Panel("Initializing...", title="[bold]Phases", border_style="blue")
+    def _build_activities(self) -> Panel:
+        """Build current activities panel with spinners."""
+        activities = self.controller.activities.get_all()
 
-        enabled_phases = self._controller.profile_config.get("phases", ["recon"])
-        completed = set(self._controller.phases_completed)
-        current = self._controller.current_phase
-        progress_data = self._controller.get_phase_progress()
-
-        text = Text()
-        for phase in enabled_phases:
-            if phase in completed:
-                text.append(f"  ✅ {phase}", style="bold green")
-            elif phase == current:
-                # Show progress
-                pdata = progress_data.get(phase, {})
-                total = pdata.get("total", 0)
-                done = pdata.get("done", 0)
-                pct = (done / total * 100) if total > 0 else 0
-                bar = _progress_bar(pct)
-                text.append(f"  ▶ {phase} ", style="bold yellow")
-                text.append(f"{bar} {pct:.0f}%", style="yellow")
-                text.append(f" ({done}/{total})", style="dim")
-            else:
-                text.append(f"  ⬜ {phase}", style="dim")
-            text.append("   ")
-
-        return Panel(text, title="[bold]Phases", border_style="blue")
-
-    def _make_findings_panel(self) -> Panel:
-        """Table of latest findings."""
-        table = Table(
-            show_header=True,
-            header_style="bold",
-            expand=True,
-            show_lines=False,
-        )
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Severity", width=10)
-        table.add_column("Type", width=12)
-        table.add_column("Endpoint", ratio=2)
-        table.add_column("Detail", ratio=3)
-        table.add_column("Time", width=8)
-
-        if self._controller is not None:
-            findings = self._controller.get_recent_findings(self._max_findings)
-            for idx, f in enumerate(reversed(findings), 1):
-                severity = f.get("severity", "INFO").upper()
-                sev_style = self.SEVERITY_COLORS.get(severity, "white")
-                ftype = f.get("type", f.get("vuln_type", "N/A"))[:12]
-                endpoint = f.get("endpoint", f.get("url", "N/A"))
-                # Truncate long endpoints (edge case #9)
-                if len(endpoint) > 60:
-                    endpoint = endpoint[:57] + "..."
-                detail = f.get("payload", f.get("detail", f.get("template_id", "N/A")))
-                if isinstance(detail, str) and len(detail) > 80:
-                    detail = detail[:77] + "..."
-                discovered = f.get("discovered_at", "")
-                time_short = discovered.split("T")[1][:8] if "T" in discovered else ""
-
-                table.add_row(
-                    str(idx),
-                    Text(severity, style=sev_style),
-                    ftype,
-                    endpoint,
-                    str(detail),
-                    time_short,
-                )
-
-                if idx >= self._max_findings:  # edge case #9
-                    break
-
-        return Panel(table, title="[bold]Latest Findings", border_style="green")
-
-    def _make_stats_panel(self) -> Panel:
-        """Statistics panel."""
-        if self._controller is None:
-            return Panel("...", title="[bold]Stats", border_style="cyan")
-
-        stats = self._controller.get_stats()
-
-        text = Text()
-        text.append("📊 Scan Statistics\n\n", style="bold")
-        text.append(f"  Tasks pushed:     {stats.get('tasks_pushed', 0)}\n")
-        text.append(f"  Tasks completed:  ", style="")
-        text.append(f"{stats.get('tasks_completed', 0)}\n", style="green")
-        text.append(f"  Tasks failed:     ", style="")
-        failed = stats.get("tasks_failed", 0)
-        text.append(f"{failed}\n", style="red" if failed > 0 else "green")
-        text.append(f"\n  Findings:         ", style="")
-        fc = stats.get("findings_count", 0)
-        text.append(f"{fc}\n", style="bold yellow" if fc > 0 else "dim")
-        text.append(f"  Requests sent:    {stats.get('requests_sent', 0)}\n")
-        text.append(f"  AI calls:         {stats.get('ai_calls', 0)}\n")
-        text.append(f"  RAG snippets:     {stats.get('rag_snippets', 0)}\n")
-
-        return Panel(text, title="[bold]Stats", border_style="cyan")
-
-    def _make_errors_panel(self) -> Panel:
-        """Recent errors panel."""
-        if self._controller is None:
-            return Panel("No errors.", title="[bold]Errors", border_style="red")
-
-        errors = self._controller.get_recent_errors(self._max_errors)
-        if not errors:
+        if not activities:
+            content = Text("  Waiting for tasks...", style="dim italic")
             return Panel(
-                Text("No errors ✓", style="green"),
-                title="[bold]Errors",
-                border_style="green",
+                content,
+                title="🔥 [bold cyan]CURRENT ACTIVITY[/]",
+                border_style="cyan",
+                box=box.ROUNDED,
+                padding=(0, 1),
             )
 
-        text = Text()
-        for err in reversed(errors[-self._max_errors :]):
-            ts = err.get("timestamp", "")
-            time_short = ts.split("T")[1][:8] if "T" in ts else ""
-            msg = err.get("message", "Unknown")
-            if len(msg) > 80:
-                msg = msg[:77] + "..."
-            text.append(f"[{time_short}] ", style="dim")
-            text.append(f"{msg}\n", style="red")
+        lines = []
+        for act in activities:
+            elapsed = int(time.time() - act.get("started_at", time.time()))
+            tool = act.get("tool", "unknown")
+            desc = act.get("description", "")
 
-        return Panel(text, title=f"[bold]Errors ({len(errors)})", border_style="red")
+            line = Text()
+            line.append("  • ", style="cyan")
+            line.append(f"{tool}", style="bold white")
+            line.append(f" {desc}", style="cyan")
+            line.append(f" [{elapsed}s]", style="dim")
+            lines.append(line)
 
-    def _make_queues_panel(self) -> Panel:
-        """Queue status bar."""
-        if self._controller is None:
-            return Panel("...", title="[bold]Queues", border_style="blue")
+        content = Text("\n").join(lines)
+        return Panel(
+            content,
+            title="🔥 [bold cyan]CURRENT ACTIVITY[/]",
+            border_style="cyan",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
 
-        queues = self._controller.get_queue_lengths()
-        parts = []
-        for q, length in queues.items():
-            name = q.split(":")[-1]
-            color = "yellow" if length > 0 else "green"
-            parts.append(f"[{color}]{name}={length}[/{color}]")
+    def _build_events(self) -> Panel:
+        """Build live events feed with color-coded entries."""
+        events = self.controller.events.get_all()
 
-        queue_text = "   ".join(parts) if parts else "No queue data"
-        return Panel(queue_text, title="[bold]Queue Status", border_style="blue")
+        if not events:
+            content = Text("  Waiting for events...", style="dim italic")
+            return Panel(
+                content,
+                title="💡 [bold green]LIVE EVENTS[/]",
+                border_style="green",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
 
-    # ------------------------------------------------------------------
-    # Stop
-    # ------------------------------------------------------------------
-    def stop(self) -> None:
-        """Stop the dashboard (terminal cleanup handled by rich)."""
-        self._stop_event.set()
-        logger.debug("Live dashboard stopped.")
+        # Show last N events (most recent at bottom)
+        display_events = events[-15:]  # Show last 15 in the panel
 
+        lines = []
+        for event in display_events:
+            ts = event.get("timestamp", "??:??:??")
+            etype = event.get("type", "info")
+            msg = event.get("message", "")
 
-# ===========================================================================
-# Helper functions
-# ===========================================================================
-def _format_duration(seconds: float) -> str:
-    """Format seconds into HH:MM:SS."""
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+            style_info = EVENT_STYLES.get(etype, EVENT_STYLES["info"])
+            icon = style_info["icon"]
+            color = style_info["color"]
 
+            line = Text()
+            line.append(f"  {ts} ", style="dim")
+            line.append(f"{icon} ", style=color)
+            line.append(msg, style=color if etype in ("critical", "phase") else "white")
+            lines.append(line)
 
-def _progress_bar(pct: float, width: int = 20) -> str:
-    """Create a text-based progress bar."""
-    filled = int(width * pct / 100)
-    empty = width - filled
-    return f"[{'█' * filled}{'░' * empty}]"
+        content = Text("\n").join(lines)
+        return Panel(
+            content,
+            title="💡 [bold green]LIVE EVENTS[/]",
+            border_style="green",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+
+    def _build_stats(self) -> Panel:
+        """Build statistics panel."""
+        stats = self.controller.stats
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Metric", style="dim")
+        table.add_column("Value", style="bold white")
+
+        table.add_row("Tasks pushed", str(stats.get("tasks_pushed", 0)))
+        table.add_row("Tasks completed", str(stats.get("tasks_completed", 0)))
+        table.add_row("Tasks failed", str(stats.get("tasks_failed", 0)))
+        table.add_row("Findings", str(stats.get("findings_count", 0)))
+        table.add_row("AI calls", str(stats.get("ai_calls", 0)))
+        table.add_row("RAG snippets", str(stats.get("rag_snippets", 0)))
+
+        return Panel(
+            table,
+            title="📊 [bold magenta]STATS[/]",
+            border_style="magenta",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+
+    def _build_tool_summaries(self) -> Panel:
+        """Build tool summaries panel."""
+        summaries = self.controller.tool_summaries
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Metric", style="dim")
+        table.add_column("Value", style="bold white")
+
+        ports = summaries.get("ports_open", [])
+        ports_str = ",".join(str(p) for p in ports[:10]) if ports else "none"
+        if len(ports) > 10:
+            ports_str += "..."
+
+        table.add_row("Ports open", ports_str)
+        table.add_row("Subdomains", str(summaries.get("subdomains", 0)))
+        table.add_row("Endpoints", str(summaries.get("endpoints", 0)))
+        table.add_row("Payloads sent", str(summaries.get("payloads_sent", 0)))
+        table.add_row("Interesting resp.", str(summaries.get("interesting_responses", 0)))
+
+        templates = summaries.get("templates_matched", 0)
+        critical = summaries.get("critical_findings", 0)
+        template_str = str(templates)
+        if critical:
+            template_str += f" ({critical} crit)"
+        table.add_row("Templates matched", template_str)
+
+        techs = summaries.get("technologies", [])
+        techs_str = ", ".join(techs[:5]) if techs else "none"
+        if len(techs) > 5:
+            techs_str += "..."
+        table.add_row("Technologies", techs_str)
+
+        return Panel(
+            table,
+            title="📦 [bold blue]TOOL SUMMARIES[/]",
+            border_style="blue",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+
+    def _build_errors(self) -> Panel:
+        """Build error panel."""
+        errors = self.controller.errors.get_all()
+
+        if not errors:
+            return Panel(
+                Text("  No errors", style="dim green"),
+                title="❌ [bold red]ERRORS[/]",
+                border_style="red",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+
+        display_errors = errors[-5:]  # Show last 5 errors
+        lines = []
+        for err in display_errors:
+            ts = err.get("timestamp", "??:??:??")
+            msg = err.get("message", "Unknown error")
+
+            line = Text()
+            line.append(f"  {ts} ", style="dim")
+            line.append("✘ ", style="red")
+            line.append(msg, style="red")
+            lines.append(line)
+
+        content = Text("\n").join(lines)
+        return Panel(
+            content,
+            title="❌ [bold red]ERRORS[/]",
+            border_style="red",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        )
+
+    def _build_queue_status(self) -> Panel:
+        """Build queue status bar."""
+        queues = self.controller.get_queue_lengths()
+
+        if not queues:
+            content = Text("  Queue status unavailable (Redis not connected)", style="dim red")
+        else:
+            content = Text()
+            content.append("  Queue Status: ", style="dim")
+            parts = []
+            for name, length in queues.items():
+                color = "green" if length == 0 else ("yellow" if length < 5 else "red")
+                parts.append(f"[{color}]{name}={length}[/]")
+            content.append(Text.from_markup("  │  ".join(parts)))
+
+        return Panel(
+            content,
+            border_style="dim",
+            box=box.ROUNDED,
+            padding=(0, 0),
+        )
+
+    # ── Plain Text Fallback ───────────────────────────────────────────
+
+    def _render_plain(self) -> str:
+        """Fallback plain text rendering when rich is not available."""
+        c = self.controller
+        lines = [
+            "=" * 60,
+            f"  CENTAUR-JARVIS | Scan: {c.scan_id} | {c.get_elapsed_time()}",
+            f"  Target: {c.targets[0] if c.targets else 'N/A'} | Profile: {c.profile_name}",
+            f"  Phase: {c.current_phase} | Status: {c.status}",
+            "-" * 60,
+            "  ACTIVITIES:",
+        ]
+        for act in c.activities.get_all():
+            lines.append(f"    • {act.get('tool')}: {act.get('description')}")
+        lines.append("-" * 60)
+        lines.append("  EVENTS (last 10):")
+        for event in c.events.get_all()[-10:]:
+            lines.append(f"    [{event.get('timestamp')}] {event.get('message')}")
+        lines.append("-" * 60)
+        lines.append(f"  Stats: tasks={c.stats.get('tasks_pushed', 0)}, "
+                     f"done={c.stats.get('tasks_completed', 0)}, "
+                     f"findings={c.stats.get('findings_count', 0)}")
+        errors = c.errors.get_all()
+        if errors:
+            lines.append("-" * 60)
+            lines.append("  ERRORS:")
+            for err in errors[-5:]:
+                lines.append(f"    ✘ [{err.get('timestamp')}] {err.get('message')}")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    # ── Public Interface ──────────────────────────────────────────────
+
+    def start(self, stop_event):
+        """
+        Start the live dashboard. Blocks until stop_event is set.
+        
+        Args:
+            stop_event: threading.Event to signal shutdown
+        """
+        if not HAS_RICH:
+            self._start_plain(stop_event)
+            return
+
+        try:
+            with Live(
+                self.render_dashboard(),
+                console=self._console,
+                refresh_per_second=1.0 / self.refresh_interval,
+                screen=True,
+                transient=False,
+            ) as live:
+                self._live = live
+                while not stop_event.is_set():
+                    try:
+                        live.update(self.render_dashboard())
+                    except Exception as e:
+                        # Handle rendering errors gracefully
+                        try:
+                            error_text = Text(f"Display error: {e}", style="red")
+                            live.update(Panel(error_text, title="ERROR"))
+                        except Exception:
+                            pass
+                    stop_event.wait(timeout=self.refresh_interval)
+        except KeyboardInterrupt:
+            stop_event.set()
+        except Exception as e:
+            if self._console:
+                self._console.print(f"[red]Display error: {e}[/red]")
+        finally:
+            self._live = None
+
+    def _start_plain(self, stop_event):
+        """Plain text display loop when rich is not available."""
+        while not stop_event.is_set():
+            try:
+                # Clear screen
+                print("\033[2J\033[H", end="")
+                print(self._render_plain())
+            except Exception as e:
+                print(f"Display error: {e}")
+            stop_event.wait(timeout=self.refresh_interval)
+
+    def print_summary(self):
+        """Print final scan summary after dashboard closes."""
+        if HAS_RICH and self._console:
+            console = self._console
+        elif HAS_RICH:
+            console = Console()
+        else:
+            print(self._render_plain())
+            return
+
+        c = self.controller
+
+        console.print()
+        console.print(Panel(
+            Text(BANNER_ART, style="bold red"),
+            border_style="red",
+            box=box.DOUBLE,
+        ))
+
+        # Summary table
+        table = Table(title="📋 Scan Summary", box=box.ROUNDED, border_style="cyan")
+        table.add_column("Metric", style="dim")
+        table.add_column("Value", style="bold")
+
+        table.add_row("Scan ID", c.scan_id)
+        table.add_row("Targets", str(len(c.targets)))
+        table.add_row("Profile", c.profile_name)
+        table.add_row("Status", f"[green]{c.status}[/]" if c.status == "COMPLETED" else f"[yellow]{c.status}[/]")
+        table.add_row("Duration", c.get_elapsed_time())
+        table.add_row("Tasks Pushed", str(c.stats.get("tasks_pushed", 0)))
+        table.add_row("Tasks Completed", str(c.stats.get("tasks_completed", 0)))
+        table.add_row("Findings", str(c.stats.get("findings_count", 0)))
+        table.add_row("AI Calls", str(c.stats.get("ai_calls", 0)))
+
+        console.print(table)
+
+        # Findings summary
+        findings = c._get_current_findings()
+        if findings:
+            findings_table = Table(title="🔍 Findings", box=box.ROUNDED, border_style="red")
+            findings_table.add_column("#", style="dim")
+            findings_table.add_column("Severity", style="bold")
+            findings_table.add_column("Type")
+            findings_table.add_column("Location")
+
+            for i, f in enumerate(findings[:20], 1):
+                sev = f.get("severity", "info").upper()
+                sev_color = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "cyan"}.get(sev, "dim")
+                findings_table.add_row(
+                    str(i),
+                    f"[{sev_color}]{sev}[/]",
+                    f.get("type", "N/A"),
+                    f.get("url", f.get("endpoint", "N/A")),
+                )
+
+            console.print(findings_table)
+
+        # Errors
+        errors = c.errors.get_all()
+        if errors:
+            console.print(f"\n[red]⚠ {len(errors)} error(s) during scan[/red]")
+            for err in errors[-5:]:
+                console.print(f"  [dim]{err.get('timestamp')}[/] [red]✘ {err.get('message')}[/]")
+
+        console.print()
